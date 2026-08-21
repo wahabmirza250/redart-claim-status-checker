@@ -1,0 +1,82 @@
+{
+  "portalId": "hcpf-colorado",
+  "portalName": "Colorado HCPF Provider Portal (Gainwell)",
+  "baseUrl": "https://colorado-hcp-portal.coxix.gainwelltechnologies.com",
+  "loginUrl": "https://colorado-hcp-portal.coxix.gainwelltechnologies.com/hcp/provider/Home/tabid/135/Default.aspx",
+
+  "selectors": {
+    "login": {
+      "usernameField": "input[id*='UserID' i], input[id*='UserName' i]",
+      "passwordField": "input[type='password']",
+      "submitButton": "text=Log In"
+    },
+
+    "navigation": {
+      "claimsMenuLink": "text=Claims",
+      "submitClaimProfLink": "text=Submit Claim Prof"
+    },
+
+    "step1_claimHeader": {
+      "payerDropdown": "#dnn_ctr722_SubmitProfessionalClaim1_PayerDropDownList_Control",
+      "payerValue": "Title XIX Payer",
+      "memberIdField": "#dnn_ctr722_SubmitProfessionalClaim1_MemberIDCmnTextBox_Control",
+      "memberNameDisplay": "#dnn_ctr722_SubmitProfessionalClaim1_MemberNameCmnLabel_Control",
+      "patientNumberField": "#dnn_ctr722_SubmitProfessionalClaim1_PatientNumberCmnTextBox_Control",
+      "dateTypeDropdown": "[id$='DateTypeCmnDropDownList_Control']",
+      "dateTypeValue": "Illness",
+      "dateOfCurrentField": "[id$='InitialIllnessDateCmnDate_Control']",
+      "transportCertYesRadio": "#dnn_ctr722_SubmitProfessionalClaim1_TransportCertificationCmnRadioButtonList_Control_0",
+      "transportCertNoRadio": "#dnn_ctr722_SubmitProfessionalClaim1_TransportCertificationCmnRadioButtonList_Control_1",
+      "signatureOnFileYesRadio": "#dnn_ctr722_SubmitProfessionalClaim1_ProviderSignatureOnFileCmnRadioButtonList_Control_0",
+      "signatureOnFileNoRadio": "#dnn_ctr722_SubmitProfessionalClaim1_ProviderSignatureOnFileCmnRadioButtonList_Control_1",
+      "continueButton": "#dnn_ctr722_SubmitProfessionalClaim1_ContinueCmnButton",
+      "cancelButton": "#dnn_ctr722_SubmitProfessionalClaim1_CancelCmnButton"
+    },
+
+    "step2_diagnosisAndServiceLines": {
+      "diagnosisTypeDropdown": "select[id*='DiagnosisType']",
+      "diagnosisTypeValue": "ICD-10-CM",
+      "diagnosisCodeField": "input[type='text'][id*='DiagnosisCode']",
+      "diagnosisCodeAddButton": "a[id*='DiagnosisCodesDataList'][id*='DGAddCmnLinkButton']",
+      "step2ContinueButton": "#dnn_ctr723_SubmitProfessionalClaim2_ContinueCmnButton"
+    },
+
+    "step3_serviceDetails": {
+      "fromDateField": "input[id*='ServiceDetailsDataList'][id*='SDDetailFromDateCmnDate'][id*='_Control_']",
+      "toDateField": "input[id*='ServiceDetailsDataList'][id*='SDDetailToDateCmnDate'][id*='_Control_']",
+      "placeOfServiceDropdown": "select[id*='ServiceDetailsDataList'][id*='SDDetailPlaceOfServiceCmnDropDownList']",
+      "placeOfServiceFallback": "99-Other Place of Service",
+      "procedureCodeField": "input[type='text'][id*='ServiceDetailsDataList'][id*='SDDetailProcedureCodeCmnTextBox'][id*='_Control_']",
+      "chargeAmountField": "input[id*='ServiceDetailsDataList'][id*='SDDetailChargeAmountCmnTextBox'][id*='_Control_']",
+      "unitsField": "input[id*='ServiceDetailsDataList'][id*='SDDetailUnitsCmnTextBox'][id*='_Control_']",
+      "unitTypeDropdown": "select[id*='ServiceDetailsDataList'][id*='SDDetailUnitsTypeCmnDropDownList']",
+      "unitTypeValue": "Unit",
+      "diagnosisPointer1Dropdown": "select[id*='ServiceDetailsDataList'][id*='SDDetailDiagPointer1CmnDropDownList']",
+      "diagnosisPointerValue": "1",
+      "addServiceLineButton": "a[id*='ServiceDetailsDataList'][id*='SDAddCmnLinkButton']",
+      "attachmentUploadLink": "text=Click to add attachment",
+      "attachmentToggleIcon": "input[type='image'][id*='Attachments'][id*='ExpandCollapseImage']",
+      "attachmentTypeDropdown": "select[id*='AttachmentsDataList'][id*='AttDetailAttachTypeCmnDropDownList']",
+      "attachmentTypeValue": "AM-Ambulance Certification",
+      "transmissionMethodDropdown": "select[id*='AttachmentsDataList'][id*='AttDetailTransMethodCmnDropDownList']",
+      "attachmentFileInput": "input[type='file'][id*='AttachmentsDataList'][id*='AttDetailCmnFileUpload']",
+      "attachmentAddButton": "a[id*='AttachmentsDataList'][id*='AttAddCmnLinkButton']",
+      "backToStep1Button": "text=Back to Step 1",
+      "backToStep2Button": "text=Back to Step 2",
+      "submitButton": "text=\"Submit\"",
+      "cancelButton": "text=Cancel"
+    }
+  },
+
+  "businessRules": {
+    "payer": "Always 'Title XIX Payer' - no other option used for NEMT Medicaid claims",
+    "transportCertification": "Always 'No' - CMS ambulance-specific attestation, RedArt only handles non-ambulance NEMT van/car transport",
+    "signatureOnFile": "Always 'Yes' if passenger signature was captured in RedArt trip form",
+    "patientNumber": "Use RedArt's internal trip UUID or passenger record ID",
+    "diagnosisCode": "MUST come from trip referral/authorization data, not invented",
+    "memberIdMissing": "If passenger only has last-4-SSN + DOB, trip must be flagged pending-eligibility-lookup",
+    "placeOfService": "Comes dynamically from Billing Settings (place_of_service column) via get-billing-rate - placeOfServiceFallback is only used if that code isn't found as a dropdown option",
+    "scopeRestriction": "Only fills explicitly confirmed fields, nothing else",
+    "memberNameDisplay": "NOT YET VERIFIED - selector is a best-guess following the same DNN naming pattern as memberIdField. Must be confirmed against the real portal (Inspect Element on whatever text shows the member's name after Member ID is entered/blurred) before verify_only mode is trusted."
+  }
+}
