@@ -60,18 +60,10 @@ async function fetchPortalCredentials(portalId, companyId) {
  *
  * companyId: which company's portal credentials to use.
  * claimId: the real Claim ID to search for.
- * useClickNavigation: TESTING A NEW HYPOTHESIS. Every attempt so far
- * navigated to the Search Claims screen via a direct page.goto() with a
- * swapped tabid in the URL. That's non-standard for this kind of classic
- * ASP.NET WebForms site - it can leave the page's __VIEWSTATE /
- * __EVENTVALIDATION hidden fields out of sync with what the server
- * expects for a postback on THIS specific form, which is a well-known
- * cause of a form silently "losing" submitted values. This flag lets us
- * test navigating via a REAL in-page link click instead - the standard,
- * expected way a browser would reach this screen - to see if that
- * changes the outcome.
+ * Reuses the exact same proven login flow and config as the main robot
+ * (same portal, same credentials store) - only the destination differs.
  */
-async function checkClaimStatus(companyId, claimId, useClickNavigation = true) {
+async function checkClaimStatus(companyId, claimId) {
   const config = loadConfig(`${__dirname}/hcpf-colorado.json`);
   const portalCredentials = await fetchPortalCredentials('hfc-colorado', companyId || null);
 
@@ -107,18 +99,22 @@ async function checkClaimStatus(companyId, claimId, useClickNavigation = true) {
         await page.waitForTimeout(1500);
 
         // --- Navigate to Search Claims ---
-        // Confirmed real location: same Claims menu as claim submission,
-        // reachable by swapping the tabid on the current URL.
-        if (useClickNavigation) {
-          // Find the real "Search Claims" link and click it in-page,
-          // exactly as a real user would, instead of jumping there via
-          // a direct URL.
-          const link = page.getByText(/search\s*claim/i).first();
-          await link.click({ timeout: 8000 });
-        } else {
-          const searchUrl = page.url().replace(/tabid\/\d+/, 'tabid/531');
-          await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 15000 });
+        // === FIXED (2026-08-21) === Confirmed via real evidence: the
+        // "Search Claims" link genuinely exists in the DOM (exactly
+        // where expected), but sits inside a collapsed DNN secondary
+        // menu (display:none) - clicking it timed out since Playwright
+        // correctly refuses to click something not visible. The fix:
+        // read its real href directly (which carries live,
+        // session-scoped tokens) and navigate there directly - gets the
+        // benefit of a real, valid session-linked URL without needing
+        // to click a hidden element at all.
+        const searchLink = page.locator('a[title="Search Claims"]').first();
+        const href = await searchLink.getAttribute('href');
+        if (!href) {
+          throw new Error('Could not find the real Search Claims link href on the page after login.');
         }
+        const searchUrl = new URL(href, page.url()).toString();
+        await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 15000 });
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         await page.waitForTimeout(1200);
         const searchScreenUrl = page.url();
@@ -173,7 +169,7 @@ async function checkClaimStatus(companyId, claimId, useClickNavigation = true) {
         return {
           status: 'CHECK_COMPLETE',
           claim_id: claimId,
-          navigation_method: useClickNavigation ? 'in_page_click' : 'direct_url',
+          navigation_method: 'href_from_dom',
           search_screen_url: searchScreenUrl,
           filled_claim_id: valueRightBeforeClick,
           nav_result: navResult,
