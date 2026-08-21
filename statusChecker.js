@@ -123,20 +123,31 @@ async function checkClaimStatus(companyId, claimId) {
         const claimIdField = page.locator('[id$="ClaimIDCmnTextBox_Control"]').last();
         await claimIdField.click();
         await claimIdField.fill('');
-        await claimIdField.pressSequentially(String(claimId), { delay: 70 });
-        await claimIdField.dispatchEvent('input').catch(() => {});
+        await claimIdField.type(String(claimId), { delay: 80 });
+        await claimIdField.dispatchEvent('keyup').catch(() => {});
         await claimIdField.dispatchEvent('change').catch(() => {});
         await claimIdField.evaluate(el => el.blur()).catch(() => {});
-        await page.waitForTimeout(400);
+        await page.waitForTimeout(500);
 
         const valueRightBeforeClick = await claimIdField.inputValue().catch(() => null);
         const searchButton = page.locator('[id$="SearchMedicalAndDentalClaimsCmnButton"]').last();
 
         let navResult = 'not_attempted';
         try {
+          // Use the button's real ASP.NET UniqueID with __doPostBack
+          // directly, rather than a generic click - this is the actual
+          // mechanism the page's own form uses to submit itself, and
+          // sidesteps any click-handling quirk entirely.
+          const uniqueId = await searchButton.evaluate(el => el.name || el.id);
           await Promise.all([
             page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }),
-            searchButton.evaluate(el => el.click())
+            page.evaluate((id) => {
+              if (typeof window.__doPostBack === 'function') {
+                window.__doPostBack(id, '');
+              } else {
+                document.getElementById(id)?.click();
+              }
+            }, uniqueId)
           ]);
           navResult = 'navigation_completed';
         } catch (e) {
@@ -161,10 +172,25 @@ async function checkClaimStatus(companyId, claimId) {
 
         await page.screenshot({ path: `${__dirname}/last-run-success.png`, fullPage: true }).catch(() => {});
 
-        // Try to pull a real status word out of whatever we found -
-        // "Paid", "Suspended", "Denied" etc. are the known real values
-        // seen on real claims so far today.
-        const statusMatch = dump.bodyTextSample?.match(/\b(Paid|Suspended|Denied|Rejected|In Process)\b/i);
+        // === FIXED (2026-08-21) === CRITICAL SAFETY FIX. Confirmed via
+        // real evidence: the previous version matched the word "Paid"
+        // anywhere in the page's visible text, including the search
+        // form's own "Claim Status: Denied / Paid / Suspended" label
+        // options - meaning it reported "Paid" as a false positive even
+        // when NO search had actually succeeded and NO claim was found.
+        // This is dangerous: it could have marked real unpaid claims as
+        // Paid in the Salary/Payroll system. Now: only ever reports a
+        // status if a genuine results grid was found (a real table with
+        // actual data rows, not the page's static form chrome). If no
+        // such table exists, this returns NO_RESULTS explicitly and
+        // NEVER guesses a status from surrounding text.
+        const realResultsTable = dump.tables?.find(t =>
+          t.rowCount > 1 && t.firstDataRowText && !/function\s+Set/.test(t.firstDataRowText)
+        );
+        const detectedStatus = realResultsTable
+          ? (realResultsTable.firstDataRowText.match(/\b(Paid|Suspended|Denied|Rejected|In Process)\b/i)?.[1] ?? null)
+          : null;
+        const resultState = realResultsTable ? 'RESULTS_FOUND' : 'NO_RESULTS';
 
         return {
           status: 'CHECK_COMPLETE',
@@ -174,7 +200,8 @@ async function checkClaimStatus(companyId, claimId) {
           filled_claim_id: valueRightBeforeClick,
           nav_result: navResult,
           results_url: resultsUrl,
-          detected_status: statusMatch ? statusMatch[1] : null,
+          result_state: resultState,
+          detected_status: detectedStatus,
           raw_dump: dump
         };
       })(),
