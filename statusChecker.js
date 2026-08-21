@@ -72,7 +72,7 @@ async function fetchPortalCredentials(portalId, companyId) {
  * changes the outcome.
  */
 async function checkClaimStatus(companyId, claimId, useClickNavigation = true) {
-  const config = loadConfig(`${__dirname}/../config/hcpf-colorado.json`);
+  const config = loadConfig(`${__dirname}/hcpf-colorado.json`);
   const portalCredentials = await fetchPortalCredentials('hfc-colorado', companyId || null);
 
   const browser = await chromium.launch({
@@ -163,7 +163,7 @@ async function checkClaimStatus(companyId, claimId, useClickNavigation = true) {
           };
         }).catch(err => ({ error: err.message }));
 
-        await page.screenshot({ path: `${__dirname}/../last-run-success.png`, fullPage: true }).catch(() => {});
+        await page.screenshot({ path: `${__dirname}/last-run-success.png`, fullPage: true }).catch(() => {});
 
         // Try to pull a real status word out of whatever we found -
         // "Paid", "Suspended", "Denied" etc. are the known real values
@@ -186,7 +186,7 @@ async function checkClaimStatus(companyId, claimId, useClickNavigation = true) {
     ]);
     return result;
   } catch (err) {
-    await page.screenshot({ path: `${__dirname}/../last-run-error.png`, fullPage: true }).catch(() => {});
+    await page.screenshot({ path: `${__dirname}/last-run-error.png`, fullPage: true }).catch(() => {});
     return { status: 'CHECK_FAILED', claim_id: claimId, error: err.message };
   } finally {
     await browser.close().catch(() => {});
