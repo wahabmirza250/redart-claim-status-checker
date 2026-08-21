@@ -37,8 +37,8 @@ app.get('/debug-server-check', (req, res) => {
 app.get('/last-run-screenshot', (req, res) => {
   const path = require('path');
   const fs = require('fs');
-  const successPath = path.join(__dirname, '../last-run-success.png');
-  const errorPath = path.join(__dirname, '../last-run-error.png');
+  const successPath = path.join(__dirname, 'last-run-success.png');
+  const errorPath = path.join(__dirname, 'last-run-error.png');
   if (fs.existsSync(errorPath)) return res.sendFile(errorPath);
   if (fs.existsSync(successPath)) return res.sendFile(successPath);
   res.status(404).json({ error: 'No screenshot available yet.' });
