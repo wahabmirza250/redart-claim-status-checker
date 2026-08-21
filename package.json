@@ -1,0 +1,13 @@
+{
+  "name": "redart-claim-status-checker",
+  "version": "1.0.0",
+  "description": "Separate, read-only service that checks real claim statuses on the HCPF portal - independent from the main submission robot.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "playwright": "1.47.0",
+    "express": "^4.19.2"
+  }
+}
