@@ -45,7 +45,7 @@ app.get('/last-run-screenshot', (req, res) => {
 });
 
 app.post('/check-claim-status', async (req, res) => {
-  const { company_id, claim_id, use_click_navigation } = req.body || {};
+  const { company_id, claim_id } = req.body || {};
   if (!claim_id) {
     return res.status(400).json({ error: 'claim_id is required.' });
   }
@@ -54,7 +54,7 @@ app.post('/check-claim-status', async (req, res) => {
   jobs[jobId] = { status: 'running', result: null, startedAt: new Date().toISOString() };
   res.json({ status: 'started', jobId, checkStatusAt: `/job-status/${jobId}` });
 
-  checkClaimStatus(company_id || null, claim_id, use_click_navigation !== false)
+  checkClaimStatus(company_id || null, claim_id)
     .then(result => {
       jobs[jobId] = { status: 'done', result, startedAt: jobs[jobId].startedAt, finishedAt: new Date().toISOString() };
     })
