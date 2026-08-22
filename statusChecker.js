@@ -124,32 +124,63 @@ async function checkClaimStatus(companyId, claimId) {
         await claimIdField.click();
         await claimIdField.fill('');
         await claimIdField.type(String(claimId), { delay: 80 });
-        await claimIdField.dispatchEvent('keyup').catch(() => {});
-        await claimIdField.dispatchEvent('change').catch(() => {});
-        await claimIdField.evaluate(el => el.blur()).catch(() => {});
+        await claimIdField.press('Tab').catch(() => {});
+        await claimIdField.evaluate(el => {
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+        }).catch(() => {});
         await page.waitForTimeout(500);
 
+        // === ADDED (2026-08-21, round 3) === Explicit pre-click check.
+        // Every attempt so far has shown the value present right before
+        // clicking, yet the server sees nothing - happening identically
+        // across two completely separate services and multiple distinct
+        // techniques. Rather than proceed on faith again, abort clearly
+        // with VALUE_LOST if it's ever not there, instead of clicking
+        // into a search we already know will fail.
         const valueRightBeforeClick = await claimIdField.inputValue().catch(() => null);
+        if (valueRightBeforeClick !== String(claimId)) {
+          await page.screenshot({ path: `${__dirname}/last-run-success.png`, fullPage: true }).catch(() => {});
+          return {
+            status: 'CHECK_COMPLETE',
+            claim_id: claimId,
+            navigation_method: 'href_from_dom',
+            search_screen_url: searchScreenUrl,
+            filled_claim_id: valueRightBeforeClick,
+            nav_result: 'aborted_value_lost_before_click',
+            result_state: 'VALUE_LOST',
+            detected_status: null
+          };
+        }
+
         const searchButton = page.locator('[id$="SearchMedicalAndDentalClaimsCmnButton"]').last();
 
         let navResult = 'not_attempted';
         try {
-          // === FIXED (2026-08-21, round 2) === Calling __doPostBack
-          // directly by name inside page.evaluate() failed with a real
-          // JS error: Playwright's evaluate() runs in strict mode, and
-          // the ASP.NET AJAX framework's own _doPostBack internals touch
-          // arguments.callee, which strict mode forbids - inherited
-          // because our explicit call sat inside that strict wrapper.
-          // Fixed by using a plain native DOM click instead - the
-          // browser dispatches this through the button's own real
-          // onclick handler in the PAGE's own script context (not our
-          // injected wrapper), so it never inherits that strict-mode
-          // restriction at all.
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }),
+          // Dual detection: we've now seen evidence pointing at both a
+          // full navigation AND a same-URL partial postback on different
+          // attempts. Race both real signals - whichever genuinely
+          // happens first is the real answer, rather than assuming one.
+          // The click must fire CONCURRENTLY with these waits, not
+          // after them, or nothing would ever trigger the signals being
+          // waited for.
+          //
+          // IMPORTANT: each race participant gets its own .catch()
+          // attached immediately - a losing promise from Promise.race
+          // keeps running in the background and can still reject later
+          // (e.g. navigation destroying the context mid-wait). Learned
+          // this the hard way earlier: an unattached rejection like that
+          // crashes the entire Node process, not just this one request.
+          const navPromise = page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 })
+            .then(() => 'navigation').catch(err => `nav_error: ${err.message}`);
+          const respPromise = page.waitForResponse(r => r.request().method() === 'POST', { timeout: 15000 })
+            .then(() => 'postback_response').catch(err => `resp_error: ${err.message}`);
+
+          const outcome = await Promise.all([
+            Promise.race([navPromise, respPromise]),
             searchButton.evaluate(el => el.click())
           ]);
-          navResult = 'navigation_completed';
+          navResult = `detected_${outcome[0]}`;
         } catch (e) {
           navResult = `navigation_wait_failed: ${e.message}`;
         }
@@ -157,6 +188,8 @@ async function checkClaimStatus(companyId, claimId) {
 
         // --- Read back whatever the results screen actually shows ---
         const resultsUrl = page.url();
+        const claimIdValueAfterClick = await page.locator('[id$="ClaimIDCmnTextBox_Control"]').last()
+          .inputValue().catch(err => `read_failed: ${err.message}`);
         const dump = await page.evaluate(() => {
           const tables = Array.from(document.querySelectorAll('table')).map(t => ({
             id: t.id || null,
@@ -198,6 +231,7 @@ async function checkClaimStatus(companyId, claimId) {
           navigation_method: 'href_from_dom',
           search_screen_url: searchScreenUrl,
           filled_claim_id: valueRightBeforeClick,
+          claim_id_value_after_click: claimIdValueAfterClick,
           nav_result: navResult,
           results_url: resultsUrl,
           result_state: resultState,
