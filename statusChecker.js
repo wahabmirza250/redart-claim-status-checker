@@ -129,16 +129,27 @@ async function checkClaimStatus(companyId, claimId) {
           el.dispatchEvent(new Event('change', { bubbles: true }));
           el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
         }).catch(() => {});
-        await page.waitForTimeout(500);
 
-        // === ADDED (2026-08-21, round 3) === Explicit pre-click check.
-        // Every attempt so far has shown the value present right before
-        // clicking, yet the server sees nothing - happening identically
-        // across two completely separate services and multiple distinct
-        // techniques. Rather than proceed on faith again, abort clearly
-        // with VALUE_LOST if it's ever not there, instead of clicking
-        // into a search we already know will fail.
-        const valueRightBeforeClick = await claimIdField.inputValue().catch(() => null);
+        // === ADDED (2026-08-21, round 4) === Confirmed via real dual
+        // detection: the postback genuinely fires, but the server
+        // receives an empty Claim ID - the value is lost specifically
+        // during/after typing, tied to the page's own "SetBusinessType"
+        // script (visible in earlier dumps), which is wired to this
+        // exact field. Rather than guess a fixed wait, wait for the
+        // portal's OWN real signal that it registered our input - the
+        // Business Type dropdown becoming enabled - before proceeding.
+        // Re-queries fresh each check instead of a cached reference, in
+        // case an UpdatePanel re-render detaches the original element.
+        const businessTypeEnabled = await page.waitForFunction(() => {
+          const el = document.querySelector('[id*="BusinessType" i][id$="_Control"]');
+          return el && !el.disabled;
+        }, { timeout: 8000 }).then(() => true).catch(() => false);
+
+        // Re-query fresh right before reading, per the same lesson -
+        // don't trust a handle that may have gone stale.
+        const freshClaimIdField = page.locator('[id$="ClaimIDCmnTextBox_Control"]').last();
+        const valueRightBeforeClick = await freshClaimIdField.inputValue().catch(() => null);
+
         if (valueRightBeforeClick !== String(claimId)) {
           await page.screenshot({ path: `${__dirname}/last-run-success.png`, fullPage: true }).catch(() => {});
           return {
@@ -147,6 +158,7 @@ async function checkClaimStatus(companyId, claimId) {
             navigation_method: 'href_from_dom',
             search_screen_url: searchScreenUrl,
             filled_claim_id: valueRightBeforeClick,
+            business_type_enabled_before_click: businessTypeEnabled,
             nav_result: 'aborted_value_lost_before_click',
             result_state: 'VALUE_LOST',
             detected_status: null
@@ -231,6 +243,7 @@ async function checkClaimStatus(companyId, claimId) {
           navigation_method: 'href_from_dom',
           search_screen_url: searchScreenUrl,
           filled_claim_id: valueRightBeforeClick,
+          business_type_enabled_before_click: businessTypeEnabled,
           claim_id_value_after_click: claimIdValueAfterClick,
           nav_result: navResult,
           results_url: resultsUrl,
