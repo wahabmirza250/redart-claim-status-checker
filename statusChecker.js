@@ -1,15 +1,9 @@
 /**
  * RedArt LLC - HCPF Colorado Claim Status Checker
  *
- * A genuinely SEPARATE service from the main submission robot, by
- * design. This does exactly one thing: log into the real HCPF portal
- * and look up a claim's real status by Claim ID - completely read-only,
- * never fills a billing form, never clicks Submit or Confirm on
- * anything. Kept deliberately small and focused so it's easy to reason
- * about, and so nothing here can ever risk the main submission service.
- *
- * Reuses the exact same proven login flow and config as the main robot
- * (same portal, same credentials store) - only the destination differs.
+ * Read-only service: logs into the Colorado HCPF provider portal and
+ * searches one Claim ID. It never opens, edits, submits, or confirms a
+ * claim.
  */
 
 const { chromium } = require('playwright');
@@ -24,11 +18,6 @@ function jitteredWait(baseMs) {
   return Math.round(baseMs - variance + Math.random() * variance * 2);
 }
 
-/**
- * Fetch this provider's own HCPF portal login from the app's secure
- * credential store - identical to the main robot's version, since this
- * is the same real, proven mechanism.
- */
 async function fetchPortalCredentials(portalId, companyId) {
   const baseUrl = process.env.BILLING_API_URL;
   const apiKey = process.env.BILLING_API_KEY;
@@ -37,9 +26,7 @@ async function fetchPortalCredentials(portalId, companyId) {
   }
 
   let url = `${baseUrl.replace(/\/$/, '')}/api/public/get-portal-credential?portal_id=${encodeURIComponent(portalId)}`;
-  if (companyId) {
-    url += `&company_id=${encodeURIComponent(companyId)}`;
-  }
+  if (companyId) url += `&company_id=${encodeURIComponent(companyId)}`;
 
   const res = await fetch(url, { headers: { 'X-API-Key': apiKey } });
   const body = await res.json().catch(() => ({}));
@@ -55,17 +42,78 @@ async function fetchPortalCredentials(portalId, companyId) {
   return { username: body.login_email, password: body.login_password };
 }
 
-/**
- * Look up ONE real claim's status by Claim ID. Read-only, always.
- *
- * companyId: which company's portal credentials to use.
- * claimId: the real Claim ID to search for.
- * Reuses the exact same proven login flow and config as the main robot
- * (same portal, same credentials store) - only the destination differs.
- */
+function redactPostedBody(postData, claimId) {
+  if (!postData) return null;
+  // Keep only the fields that are useful to diagnose WebForms submission.
+  // Do not return the full ViewState or unrelated form contents.
+  const out = {
+    has_claim_field: postData.includes('ClaimIDCmnTextBox'),
+    has_claim_value: postData.includes(String(claimId)),
+    has_viewstate: postData.includes('__VIEWSTATE'),
+    has_search_button: postData.includes('SearchMedicalAndDentalClaimsCmnButton'),
+    has_async_post: postData.includes('__ASYNCPOST'),
+    has_script_manager: /ScriptManager/i.test(postData),
+    event_target: null,
+    event_argument: null,
+    body_length: postData.length
+  };
+
+  // Playwright returns multipart bodies as raw text on this portal. Pull out
+  // EVENTTARGET/EVENTARGUMENT without exposing the rest of the form.
+  for (const key of ['__EVENTTARGET', '__EVENTARGUMENT']) {
+    const multipart = new RegExp(`name="${key}"\\r?\\n\\r?\\n([^\\r\\n]*)`, 'i').exec(postData);
+    const urlEncoded = new RegExp(`(?:^|&)${key}=([^&]*)`, 'i').exec(postData);
+    const value = multipart?.[1] ?? (urlEncoded ? decodeURIComponent(urlEncoded[1].replace(/\+/g, ' ')) : null);
+    if (key === '__EVENTTARGET') out.event_target = value;
+    else out.event_argument = value;
+  }
+  return out;
+}
+
+async function getFreshSearchClaimsHref(page) {
+  // Expand the real Claims menu first so we prefer the same link a human
+  // would use. The session-specific p17/p6 values must come from THIS login.
+  const claimsMenu = page.getByText('Claims', { exact: true }).first();
+  await claimsMenu.hover({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(500);
+
+  const candidates = await page.evaluate(() => {
+    const anchors = Array.from(document.querySelectorAll('a'));
+    return anchors
+      .filter(a => {
+        const text = (a.textContent || '').trim();
+        const title = (a.getAttribute('title') || '').trim();
+        const href = a.getAttribute('href') || '';
+        return /Search Claims/i.test(text) || /Search Claims/i.test(title) || /\/Claims\/SearchClaims\//i.test(href);
+      })
+      .map(a => {
+        const r = a.getBoundingClientRect();
+        const s = getComputedStyle(a);
+        const visible = r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        return {
+          href: a.getAttribute('href'),
+          text: (a.textContent || '').trim(),
+          title: (a.getAttribute('title') || '').trim(),
+          visible
+        };
+      })
+      .filter(x => x.href && /SearchClaims/i.test(x.href));
+  });
+
+  if (!candidates.length) {
+    throw new Error('Could not find a Search Claims link after login.');
+  }
+
+  // Prefer the visible/exact menu item. If DNN keeps it hidden, use the href
+  // harvested from this freshly authenticated page. Never reuse a stored URL.
+  const chosen = candidates.find(c => c.visible && /Search Claims/i.test(c.text || c.title)) || candidates[0];
+  return { href: chosen.href, candidates };
+}
+
 async function checkClaimStatus(companyId, claimId) {
   const config = loadConfig(`${__dirname}/hcpf-colorado.json`);
   const portalCredentials = await fetchPortalCredentials('hfc-colorado', companyId || null);
+  const claimIdString = String(claimId);
 
   const browser = await chromium.launch({
     headless: true,
@@ -77,290 +125,172 @@ async function checkClaimStatus(companyId, claimId) {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
-  const page = await context.newPage();
 
+  const page = await context.newPage();
   const TIMEOUT_MS = 3 * 60 * 1000;
   const timeout = new Promise((_, reject) =>
     setTimeout(() => reject(new Error(`Status check timed out after ${TIMEOUT_MS / 1000}s`)), TIMEOUT_MS)
   );
 
   try {
-    const result = await Promise.race([
+    return await Promise.race([
       (async () => {
-        // --- Login (identical to the main robot's proven flow) ---
-        await page.goto(config.loginUrl || config.baseUrl);
+        // ----- Login -----
+        await page.goto(config.loginUrl || config.baseUrl, { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(jitteredWait(600));
         await page.fill(config.selectors.login.usernameField, portalCredentials.username);
-        await page.waitForTimeout(jitteredWait(400));
+        await page.waitForTimeout(jitteredWait(350));
         await page.fill(config.selectors.login.passwordField, portalCredentials.password);
-        await page.waitForTimeout(jitteredWait(300));
+        await page.waitForTimeout(jitteredWait(250));
         await page.click(config.selectors.login.submitButton);
-        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-        await page.waitForTimeout(1500);
-
-        // --- Navigate to Search Claims ---
-        // === FIXED (2026-08-21) === Confirmed via real evidence: the
-        // "Search Claims" link genuinely exists in the DOM (exactly
-        // where expected), but sits inside a collapsed DNN secondary
-        // menu (display:none) - clicking it timed out since Playwright
-        // correctly refuses to click something not visible. The fix:
-        // read its real href directly (which carries live,
-        // === FIXED (2026-08-22, round 9) === Every structural theory
-        // about the Claim ID field itself is now disproven with hard
-        // evidence - it's enabled, correctly named, genuinely in the
-        // form, visible, no hidden proxy. The value is correct right up
-        // to the moment of submission and still doesn't survive. This
-        // points to something at the navigation/session level, not the
-        // field: direct page.goto() to this URL, while it loads the
-        // correct real page, may not carry the exact same internal
-        // session-validation lineage (ASP.NET's anti-tampering tokens)
-        // as a genuine browser click would. This is the one real
-        // combination not yet tried: force-click the real link itself
-        // (bypassing Playwright's normal "must be visible" check, since
-        // we know it's real but hidden inside a collapsed menu) rather
-        // than jump straight to its URL - a real click event through
-        // the real DOM element, which may establish page state a raw
-        // URL load doesn't.
-        const searchLink = page.locator('a[title="Search Claims"]').first();
-        const href = await searchLink.getAttribute('href');
-        if (!href) {
-          throw new Error('Could not find the real Search Claims link href on the page after login.');
-        }
-        let navigationMethodUsed = 'force_click';
-        try {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }),
-            searchLink.click({ force: true, timeout: 8000 })
-          ]);
-        } catch (e) {
-          // Fall back to the previously-proven-reliable direct URL
-          // method if the force-click doesn't work for any reason - we
-          // don't want to lose existing reliability while testing this.
-          navigationMethodUsed = 'direct_url_fallback';
-          const searchUrl = new URL(href, page.url()).toString();
-          await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 15000 });
-        }
+        await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         await page.waitForTimeout(1200);
-        const searchScreenUrl = page.url();
 
-        // --- Search by Claim ID (confirmed: alone is sufficient) ---
-        const claimIdField = page.locator('[id$="ClaimIDCmnTextBox_Control"]').last();
+        if (/login/i.test(page.url()) || await page.locator('input[type="password"]').isVisible().catch(() => false)) {
+          throw new Error('Portal login did not complete. The session may have been invalidated by another concurrent robot login.');
+        }
+
+        // ----- Navigate with a FRESH Search Claims URL from this session -----
+        // Live testing proved the search works when the p17/p6 tokens are
+        // harvested from the current authenticated page. A stale token pair
+        // renders the form but causes the postback to come back pristine/blank.
+        const { href: freshHref, candidates } = await getFreshSearchClaimsHref(page);
+        const searchUrl = new URL(freshHref, page.url()).toString();
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        await page.waitForTimeout(900);
+
+        const searchScreenUrl = page.url();
+        const claimIdField = page.locator('[id$="SearchMedicalAndDentalClaimsTabPanel_ClaimIDCmnTextBox_Control"]').first();
+        await claimIdField.waitFor({ state: 'visible', timeout: 12000 });
+
+        // ----- Fill exactly like the successful human-like control -----
         await claimIdField.click();
         await claimIdField.fill('');
-        await claimIdField.type(String(claimId), { delay: 80 });
+        await claimIdField.type(claimIdString, { delay: 90 });
+        await page.keyboard.press('Tab');
+        await page.waitForTimeout(350);
 
-        // === ADDED (2026-08-21, round 6) === Real diagnostic: check the
-        // value at the EARLIEST possible moment, right after typing and
-        // before Tab/blur ever fires. Suspicion: our own press('Tab')
-        // call may itself be triggering the portal's mask-validation
-        // logic and wiping the field BEFORE the explicit handler call
-        // that follows - meaning the handler was correctly invoked on
-        // an already-empty field, not that the handler itself failed.
-        const valueImmediatelyAfterTyping = await claimIdField.inputValue().catch(() => null);
-
-        // === ADDED (2026-08-21, round 7) === Real, precise evidence
-        // now points to a DUPLICATE ELEMENT mismatch: typing lands on
-        // whichever node .last() resolves to at that moment, but the
-        // portal's own inline handler looks the field up by its EXACT,
-        // hardcoded ID string (visible in the handler attribute itself,
-        // e.g. "dnn_ctr1016_..._ClaimIDCmnTextBox_Control") via $get() -
-        // if that's a DIFFERENT node than the one we typed into, the
-        // portal sees it as empty regardless of what we typed. Fix:
-        // extract that exact real ID directly from the handler
-        // attribute (which we already read), then explicitly verify and
-        // set the value on that SPECIFIC element - the same one the
-        // portal itself will actually read - not a suffix-based guess.
-        const handlerAttrProbe = await claimIdField.evaluate(el =>
-          el.getAttribute('onkeyup') || el.getAttribute('onchange') || ''
-        ).catch(() => '');
-        const exactIdMatch = handlerAttrProbe.match(/SetBusinessType\('([^']+)'/);
-        const exactClaimIdFieldId = exactIdMatch ? exactIdMatch[1] : null;
-
-        const duplicateNodeCheck = await page.evaluate(([targetValue, exactId]) => {
-          const nodes = Array.from(document.querySelectorAll('[id$="ClaimIDCmnTextBox_Control"]'));
-          const byExactId = exactId ? document.getElementById(exactId) : null;
-          // Set the value directly on every matching node, including
-          // the specific one the portal's own code will actually read -
-          // belt-and-suspenders, since we now have real evidence more
-          // than one may exist.
-          nodes.forEach(n => { n.value = targetValue; });
-          if (byExactId) byExactId.value = targetValue;
-          return {
-            nodeCount: nodes.length,
-            exactIdFound: Boolean(byExactId),
-            exactIdValueAfterSet: byExactId ? byExactId.value : null,
-            allNodeValues: nodes.map(n => n.value)
-          };
-        }, [String(claimId), exactClaimIdFieldId]).catch(err => ({ error: err.message }));
-
-        // === ADDED (2026-08-21, round 8) === Duplicate-node theory now
-        // DISPROVEN with real evidence (exactly one node, correct value
-        // confirmed set). Remaining real possibilities, checked all at
-        // once: the field is disabled/readonly (never posted), missing
-        // its "name" attribute entirely (never posted), sitting inside a
-        // hidden/inactive tab panel (excluded from postback), or there's
-        // a separate hidden mask-extender proxy field that's the one
-        // actually read on submit while this visible box is cosmetic.
-        const postFormDiagnostic = await page.evaluate((exactId) => {
-          const el = exactId ? document.getElementById(exactId) : null;
-          if (!el) return { error: 'element_not_found_for_diagnostic' };
-          let hiddenAncestor = null;
-          let n = el;
-          while (n) {
-            const style = window.getComputedStyle(n);
-            if (style.display === 'none' || style.visibility === 'hidden') {
-              hiddenAncestor = n.id || n.className || n.tagName;
-              break;
-            }
-            n = n.parentElement;
-          }
-          const siblingHiddens = Array.from(document.querySelectorAll('input[type="hidden"][id*="ClaimID" i]'))
-            .map(h => ({ id: h.id, name: h.getAttribute('name'), value: h.value }));
-          return {
-            disabled: el.disabled,
-            readOnly: el.readOnly,
-            name: el.getAttribute('name'),
-            inForm: Boolean(el.closest('form')),
-            formId: el.closest('form')?.id ?? null,
-            hiddenAncestor,
-            siblingHiddens
-          };
-        }, exactClaimIdFieldId).catch(err => ({ error: err.message }));
-
-        await claimIdField.press('Tab').catch(() => {});
-        await claimIdField.evaluate(el => {
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-          el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-        }).catch(() => {});
-
-        // === FIXED (2026-08-22, final) === Confirmed via a real, direct
-        // DOM inspection of the live Search Claims screen: there is NO
-        // "Business Type" dropdown anywhere on this page. The inline
-        // onkeyup="SetBusinessType(...)" handler is a global DNN layout
-        // artifact that doesn't apply here - it was never going to fire
-        // meaningfully, and the entire wait/invoke logic built around it
-        // was chasing a control that doesn't exist. Removed entirely.
-        // Confirmed instead: Claim ID is fully enabled and usable from
-        // page load with zero prerequisites, and the real page text
-        // itself confirms Claim ID alone is a valid, complete search.
-
-        // Re-query fresh right before reading, per the earlier lesson -
-        // don't trust a handle that may have gone stale.
-        const freshClaimIdField = page.locator('[id$="ClaimIDCmnTextBox_Control"]').last();
-        const valueRightBeforeClick = await freshClaimIdField.inputValue().catch(() => null);
-
-        if (valueRightBeforeClick !== String(claimId)) {
-          await page.screenshot({ path: `${__dirname}/last-run-success.png`, fullPage: true }).catch(() => {});
+        const valueImmediatelyAfterTyping = await claimIdField.inputValue();
+        if (valueImmediatelyAfterTyping !== claimIdString) {
           return {
             status: 'CHECK_COMPLETE',
             claim_id: claimId,
-            navigation_method: navigationMethodUsed,
+            navigation_method: 'fresh_session_href',
             search_screen_url: searchScreenUrl,
-            filled_claim_id: valueRightBeforeClick,
-            value_immediately_after_typing: valueImmediatelyAfterTyping,
-            duplicate_node_check: duplicateNodeCheck,
-            post_form_diagnostic: postFormDiagnostic,
-            exact_claim_id_field_id: exactClaimIdFieldId,
-            nav_result: 'aborted_value_lost_before_click',
+            filled_claim_id: valueImmediatelyAfterTyping,
             result_state: 'VALUE_LOST',
-            detected_status: null
+            detected_status: null,
+            nav_result: 'aborted_value_lost_before_click'
           };
         }
 
-        const searchButton = page.locator('[id$="SearchMedicalAndDentalClaimsCmnButton"]').last();
+        const fieldDiagnostic = await claimIdField.evaluate(el => ({
+          id: el.id,
+          name: el.getAttribute('name'),
+          disabled: el.disabled,
+          readOnly: el.readOnly,
+          inForm: Boolean(el.closest('form')),
+          formId: el.closest('form')?.id || null
+        }));
+
+        // Capture only the successful/failed Search Claims POST metadata.
+        let capturedPost = null;
+        const onRequest = req => {
+          if (capturedPost || req.method() !== 'POST') return;
+          if (!/SearchClaims/i.test(req.url())) return;
+          capturedPost = {
+            url: req.url(),
+            resource_type: req.resourceType(),
+            form: redactPostedBody(req.postData(), claimIdString)
+          };
+        };
+        page.on('request', onRequest);
+
+        const searchButton = page.locator('[id$="SearchMedicalAndDentalClaimsCmnButton"]').first();
+        await searchButton.waitFor({ state: 'visible', timeout: 8000 });
 
         let navResult = 'not_attempted';
         try {
-          // Dual detection: we've now seen evidence pointing at both a
-          // full navigation AND a same-URL partial postback on different
-          // attempts. Race both real signals - whichever genuinely
-          // happens first is the real answer, rather than assuming one.
-          // The click must fire CONCURRENTLY with these waits, not
-          // after them, or nothing would ever trigger the signals being
-          // waited for.
-          //
-          // IMPORTANT: each race participant gets its own .catch()
-          // attached immediately - a losing promise from Promise.race
-          // keeps running in the background and can still reject later
-          // (e.g. navigation destroying the context mid-wait). Learned
-          // this the hard way earlier: an unattached rejection like that
-          // crashes the entire Node process, not just this one request.
-          const navPromise = page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 })
-            .then(() => 'navigation').catch(err => `nav_error: ${err.message}`);
-          const respPromise = page.waitForResponse(r => r.request().method() === 'POST', { timeout: 15000 })
-            .then(() => 'postback_response').catch(err => `resp_error: ${err.message}`);
-
-          const outcome = await Promise.all([
-            Promise.race([navPromise, respPromise]),
-            searchButton.evaluate(el => el.click())
-          ]);
-          navResult = `detected_${outcome[0]}`;
-        } catch (e) {
-          navResult = `navigation_wait_failed: ${e.message}`;
+          const nav = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 })
+            .then(() => 'navigation_completed')
+            .catch(err => `navigation_wait_failed: ${err.message}`);
+          await searchButton.click();
+          navResult = await nav;
+        } catch (err) {
+          navResult = `click_failed: ${err.message}`;
         }
-        await page.waitForTimeout(1500);
 
-        // --- Read back whatever the results screen actually shows ---
+        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        await page.waitForTimeout(1000);
+        page.off('request', onRequest);
+
         const resultsUrl = page.url();
-        const claimIdValueAfterClick = await page.locator('[id$="ClaimIDCmnTextBox_Control"]').last()
-          .inputValue().catch(err => `read_failed: ${err.message}`);
-        const dump = await page.evaluate(() => {
-          const tables = Array.from(document.querySelectorAll('table')).map(t => ({
-            id: t.id || null,
-            rowCount: t.querySelectorAll('tr').length,
-            headerText: t.querySelector('tr')?.textContent?.trim().slice(0, 200) || null,
-            firstDataRowText: t.querySelectorAll('tr')[1]?.textContent?.trim().slice(0, 300) || null
-          })).filter(t => t.rowCount > 1);
+        const claimIdValueAfterClick = await page.locator('[id$="SearchMedicalAndDentalClaimsTabPanel_ClaimIDCmnTextBox_Control"]')
+          .first().inputValue().catch(() => null);
+
+        // Find the actual result row for THIS claim. Do not infer Paid from the
+        // search form's status dropdown text.
+        const parsed = await page.evaluate((wantedClaim) => {
+          const rows = Array.from(document.querySelectorAll('tr'));
+          for (const row of rows) {
+            const cells = Array.from(row.querySelectorAll('th,td'))
+              .map(c => (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim())
+              .filter(Boolean);
+            if (!cells.length) continue;
+            if (!cells.some(c => c.includes(wantedClaim))) continue;
+            const joined = cells.join(' | ');
+            const status = joined.match(/\b(Paid|Suspended|Denied|Rejected|In Process)\b/i)?.[1] || null;
+            const paidAmount = joined.match(/\$[\d,]+(?:\.\d{2})?/)?.[0] || null;
+            const dates = joined.match(/\b\d{2}\/\d{2}\/\d{4}\b/g) || [];
+            return {
+              found: true,
+              cells,
+              row_text: joined.slice(0, 1000),
+              status,
+              paid_amount: paidAmount,
+              dates
+            };
+          }
+          const body = document.body.innerText || '';
           return {
-            tables,
-            bodyTextSample: document.body.innerText.slice(0, 3000)
+            found: false,
+            cells: [],
+            row_text: null,
+            status: null,
+            paid_amount: null,
+            dates: [],
+            total_records_zero: /Total\s+Records\s*:?\s*0\b/i.test(body),
+            body_text_sample: body.slice(0, 3000)
           };
-        }).catch(err => ({ error: err.message }));
+        }, claimIdString);
 
         await page.screenshot({ path: `${__dirname}/last-run-success.png`, fullPage: true }).catch(() => {});
-
-        // === FIXED (2026-08-21) === CRITICAL SAFETY FIX. Confirmed via
-        // real evidence: the previous version matched the word "Paid"
-        // anywhere in the page's visible text, including the search
-        // form's own "Claim Status: Denied / Paid / Suspended" label
-        // options - meaning it reported "Paid" as a false positive even
-        // when NO search had actually succeeded and NO claim was found.
-        // This is dangerous: it could have marked real unpaid claims as
-        // Paid in the Salary/Payroll system. Now: only ever reports a
-        // status if a genuine results grid was found (a real table with
-        // actual data rows, not the page's static form chrome). If no
-        // such table exists, this returns NO_RESULTS explicitly and
-        // NEVER guesses a status from surrounding text.
-        const realResultsTable = dump.tables?.find(t =>
-          t.rowCount > 1 && t.firstDataRowText && !/function\s+Set/.test(t.firstDataRowText)
-        );
-        const detectedStatus = realResultsTable
-          ? (realResultsTable.firstDataRowText.match(/\b(Paid|Suspended|Denied|Rejected|In Process)\b/i)?.[1] ?? null)
-          : null;
-        const resultState = realResultsTable ? 'RESULTS_FOUND' : 'NO_RESULTS';
 
         return {
           status: 'CHECK_COMPLETE',
           claim_id: claimId,
-          navigation_method: navigationMethodUsed,
+          navigation_method: 'fresh_session_href',
+          search_link_candidates: candidates.map(c => ({ visible: c.visible, title: c.title, text: c.text })),
           search_screen_url: searchScreenUrl,
-          filled_claim_id: valueRightBeforeClick,
-          value_immediately_after_typing: valueImmediatelyAfterTyping,
-          duplicate_node_check: duplicateNodeCheck,
-          post_form_diagnostic: postFormDiagnostic,
-          exact_claim_id_field_id: exactClaimIdFieldId,
+          filled_claim_id: valueImmediatelyAfterTyping,
+          post_form_diagnostic: fieldDiagnostic,
           claim_id_value_after_click: claimIdValueAfterClick,
           nav_result: navResult,
           results_url: resultsUrl,
-          result_state: resultState,
-          detected_status: detectedStatus,
-          raw_dump: dump
+          result_state: parsed.found ? 'RESULTS_FOUND' : (parsed.total_records_zero ? 'NO_RESULTS' : 'NO_RESULTS'),
+          detected_status: parsed.status,
+          paid_amount: parsed.paid_amount,
+          result_row: parsed.found ? parsed.cells : null,
+          wire_capture: capturedPost,
+          raw_dump: parsed.found
+            ? { row_text: parsed.row_text, dates: parsed.dates }
+            : { bodyTextSample: parsed.body_text_sample || null }
         };
       })(),
       timeout
     ]);
-    return result;
   } catch (err) {
     await page.screenshot({ path: `${__dirname}/last-run-error.png`, fullPage: true }).catch(() => {});
     return { status: 'CHECK_FAILED', claim_id: claimId, error: err.message };
