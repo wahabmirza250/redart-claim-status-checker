@@ -124,6 +124,16 @@ async function checkClaimStatus(companyId, claimId) {
         await claimIdField.click();
         await claimIdField.fill('');
         await claimIdField.type(String(claimId), { delay: 80 });
+
+        // === ADDED (2026-08-21, round 6) === Real diagnostic: check the
+        // value at the EARLIEST possible moment, right after typing and
+        // before Tab/blur ever fires. Suspicion: our own press('Tab')
+        // call may itself be triggering the portal's mask-validation
+        // logic and wiping the field BEFORE the explicit handler call
+        // that follows - meaning the handler was correctly invoked on
+        // an already-empty field, not that the handler itself failed.
+        const valueImmediatelyAfterTyping = await claimIdField.inputValue().catch(() => null);
+
         await claimIdField.press('Tab').catch(() => {});
         await claimIdField.evaluate(el => {
           el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -179,6 +189,7 @@ async function checkClaimStatus(companyId, claimId) {
             navigation_method: 'href_from_dom',
             search_screen_url: searchScreenUrl,
             filled_claim_id: valueRightBeforeClick,
+            value_immediately_after_typing: valueImmediatelyAfterTyping,
             business_type_enabled_before_click: businessTypeEnabled,
             business_type_call_result: businessTypeCallResult,
             nav_result: 'aborted_value_lost_before_click',
@@ -265,6 +276,7 @@ async function checkClaimStatus(companyId, claimId) {
           navigation_method: 'href_from_dom',
           search_screen_url: searchScreenUrl,
           filled_claim_id: valueRightBeforeClick,
+          value_immediately_after_typing: valueImmediatelyAfterTyping,
           business_type_enabled_before_click: businessTypeEnabled,
           business_type_call_result: businessTypeCallResult,
           claim_id_value_after_click: claimIdValueAfterClick,
