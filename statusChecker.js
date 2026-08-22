@@ -130,16 +130,37 @@ async function checkClaimStatus(companyId, claimId) {
           el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
         }).catch(() => {});
 
-        // === ADDED (2026-08-21, round 4) === Confirmed via real dual
-        // detection: the postback genuinely fires, but the server
-        // receives an empty Claim ID - the value is lost specifically
-        // during/after typing, tied to the page's own "SetBusinessType"
-        // script (visible in earlier dumps), which is wired to this
-        // exact field. Rather than guess a fixed wait, wait for the
-        // portal's OWN real signal that it registered our input - the
-        // Business Type dropdown becoming enabled - before proceeding.
-        // Re-queries fresh each check instead of a cached reference, in
-        // case an UpdatePanel re-render detaches the original element.
+        // === ADDED (2026-08-21, round 5) === Real, precise root cause
+        // confirmed: this field has an inline onkeyup="SetBusinessType(...)"
+        // HTML attribute handler - generic dispatched events (even from
+        // real type()) don't reliably trigger this specific kind of
+        // inline attribute handler the same way a genuine physical
+        // keystroke does. Rather than keep guessing at event dispatch,
+        // read the handler's exact real arguments directly off the page
+        // and call the named function itself explicitly - the same
+        // thing the portal's own code does internally, called the exact
+        // same way.
+        const businessTypeCallResult = await claimIdField.evaluate(el => {
+          const handlerAttr = el.getAttribute('onkeyup') || el.getAttribute('onchange');
+          if (!handlerAttr) return { called: false, reason: 'no_handler_attribute_found' };
+          try {
+            // The attribute is literally JS source (e.g.
+            // SetBusinessType('id1','id2','id3')) - execute it in the
+            // page's own real context via a same-element inline handler
+            // invocation, not eval() in our injected context, so it runs
+            // exactly as the browser would run it on a real keystroke.
+            const fn = new Function(handlerAttr);
+            fn.call(el);
+            return { called: true, handlerAttr };
+          } catch (e) {
+            return { called: false, reason: e.message, handlerAttr };
+          }
+        }).catch(err => ({ called: false, reason: `evaluate_failed: ${err.message}` }));
+
+        // Wait for the portal's OWN real signal that it registered our
+        // input - the Business Type dropdown becoming enabled - before
+        // proceeding. Re-queries fresh each check instead of a cached
+        // reference, in case an UpdatePanel re-render detaches it.
         const businessTypeEnabled = await page.waitForFunction(() => {
           const el = document.querySelector('[id*="BusinessType" i][id$="_Control"]');
           return el && !el.disabled;
@@ -159,6 +180,7 @@ async function checkClaimStatus(companyId, claimId) {
             search_screen_url: searchScreenUrl,
             filled_claim_id: valueRightBeforeClick,
             business_type_enabled_before_click: businessTypeEnabled,
+            business_type_call_result: businessTypeCallResult,
             nav_result: 'aborted_value_lost_before_click',
             result_state: 'VALUE_LOST',
             detected_status: null
@@ -244,6 +266,7 @@ async function checkClaimStatus(companyId, claimId) {
           search_screen_url: searchScreenUrl,
           filled_claim_id: valueRightBeforeClick,
           business_type_enabled_before_click: businessTypeEnabled,
+          business_type_call_result: businessTypeCallResult,
           claim_id_value_after_click: claimIdValueAfterClick,
           nav_result: navResult,
           results_url: resultsUrl,
