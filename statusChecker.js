@@ -169,6 +169,40 @@ async function checkClaimStatus(companyId, claimId) {
           };
         }, [String(claimId), exactClaimIdFieldId]).catch(err => ({ error: err.message }));
 
+        // === ADDED (2026-08-21, round 8) === Duplicate-node theory now
+        // DISPROVEN with real evidence (exactly one node, correct value
+        // confirmed set). Remaining real possibilities, checked all at
+        // once: the field is disabled/readonly (never posted), missing
+        // its "name" attribute entirely (never posted), sitting inside a
+        // hidden/inactive tab panel (excluded from postback), or there's
+        // a separate hidden mask-extender proxy field that's the one
+        // actually read on submit while this visible box is cosmetic.
+        const postFormDiagnostic = await page.evaluate((exactId) => {
+          const el = exactId ? document.getElementById(exactId) : null;
+          if (!el) return { error: 'element_not_found_for_diagnostic' };
+          let hiddenAncestor = null;
+          let n = el;
+          while (n) {
+            const style = window.getComputedStyle(n);
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              hiddenAncestor = n.id || n.className || n.tagName;
+              break;
+            }
+            n = n.parentElement;
+          }
+          const siblingHiddens = Array.from(document.querySelectorAll('input[type="hidden"][id*="ClaimID" i]'))
+            .map(h => ({ id: h.id, name: h.getAttribute('name'), value: h.value }));
+          return {
+            disabled: el.disabled,
+            readOnly: el.readOnly,
+            name: el.getAttribute('name'),
+            inForm: Boolean(el.closest('form')),
+            formId: el.closest('form')?.id ?? null,
+            hiddenAncestor,
+            siblingHiddens
+          };
+        }, exactClaimIdFieldId).catch(err => ({ error: err.message }));
+
         await claimIdField.press('Tab').catch(() => {});
         await claimIdField.evaluate(el => {
           el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -226,6 +260,7 @@ async function checkClaimStatus(companyId, claimId) {
             filled_claim_id: valueRightBeforeClick,
             value_immediately_after_typing: valueImmediatelyAfterTyping,
             duplicate_node_check: duplicateNodeCheck,
+          post_form_diagnostic: postFormDiagnostic,
             exact_claim_id_field_id: exactClaimIdFieldId,
             business_type_enabled_before_click: businessTypeEnabled,
             business_type_call_result: businessTypeCallResult,
@@ -315,6 +350,7 @@ async function checkClaimStatus(companyId, claimId) {
           filled_claim_id: valueRightBeforeClick,
           value_immediately_after_typing: valueImmediatelyAfterTyping,
           duplicate_node_check: duplicateNodeCheck,
+          post_form_diagnostic: postFormDiagnostic,
           exact_claim_id_field_id: exactClaimIdFieldId,
           business_type_enabled_before_click: businessTypeEnabled,
           business_type_call_result: businessTypeCallResult,
