@@ -134,20 +134,20 @@ async function checkClaimStatus(companyId, claimId) {
 
         let navResult = 'not_attempted';
         try {
-          // Use the button's real ASP.NET UniqueID with __doPostBack
-          // directly, rather than a generic click - this is the actual
-          // mechanism the page's own form uses to submit itself, and
-          // sidesteps any click-handling quirk entirely.
-          const uniqueId = await searchButton.evaluate(el => el.name || el.id);
+          // === FIXED (2026-08-21, round 2) === Calling __doPostBack
+          // directly by name inside page.evaluate() failed with a real
+          // JS error: Playwright's evaluate() runs in strict mode, and
+          // the ASP.NET AJAX framework's own _doPostBack internals touch
+          // arguments.callee, which strict mode forbids - inherited
+          // because our explicit call sat inside that strict wrapper.
+          // Fixed by using a plain native DOM click instead - the
+          // browser dispatches this through the button's own real
+          // onclick handler in the PAGE's own script context (not our
+          // injected wrapper), so it never inherits that strict-mode
+          // restriction at all.
           await Promise.all([
             page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }),
-            page.evaluate((id) => {
-              if (typeof window.__doPostBack === 'function') {
-                window.__doPostBack(id, '');
-              } else {
-                document.getElementById(id)?.click();
-              }
-            }, uniqueId)
+            searchButton.evaluate(el => el.click())
           ]);
           navResult = 'navigation_completed';
         } catch (e) {
