@@ -134,6 +134,41 @@ async function checkClaimStatus(companyId, claimId) {
         // an already-empty field, not that the handler itself failed.
         const valueImmediatelyAfterTyping = await claimIdField.inputValue().catch(() => null);
 
+        // === ADDED (2026-08-21, round 7) === Real, precise evidence
+        // now points to a DUPLICATE ELEMENT mismatch: typing lands on
+        // whichever node .last() resolves to at that moment, but the
+        // portal's own inline handler looks the field up by its EXACT,
+        // hardcoded ID string (visible in the handler attribute itself,
+        // e.g. "dnn_ctr1016_..._ClaimIDCmnTextBox_Control") via $get() -
+        // if that's a DIFFERENT node than the one we typed into, the
+        // portal sees it as empty regardless of what we typed. Fix:
+        // extract that exact real ID directly from the handler
+        // attribute (which we already read), then explicitly verify and
+        // set the value on that SPECIFIC element - the same one the
+        // portal itself will actually read - not a suffix-based guess.
+        const handlerAttrProbe = await claimIdField.evaluate(el =>
+          el.getAttribute('onkeyup') || el.getAttribute('onchange') || ''
+        ).catch(() => '');
+        const exactIdMatch = handlerAttrProbe.match(/SetBusinessType\('([^']+)'/);
+        const exactClaimIdFieldId = exactIdMatch ? exactIdMatch[1] : null;
+
+        const duplicateNodeCheck = await page.evaluate(([targetValue, exactId]) => {
+          const nodes = Array.from(document.querySelectorAll('[id$="ClaimIDCmnTextBox_Control"]'));
+          const byExactId = exactId ? document.getElementById(exactId) : null;
+          // Set the value directly on every matching node, including
+          // the specific one the portal's own code will actually read -
+          // belt-and-suspenders, since we now have real evidence more
+          // than one may exist.
+          nodes.forEach(n => { n.value = targetValue; });
+          if (byExactId) byExactId.value = targetValue;
+          return {
+            nodeCount: nodes.length,
+            exactIdFound: Boolean(byExactId),
+            exactIdValueAfterSet: byExactId ? byExactId.value : null,
+            allNodeValues: nodes.map(n => n.value)
+          };
+        }, [String(claimId), exactClaimIdFieldId]).catch(err => ({ error: err.message }));
+
         await claimIdField.press('Tab').catch(() => {});
         await claimIdField.evaluate(el => {
           el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -190,6 +225,8 @@ async function checkClaimStatus(companyId, claimId) {
             search_screen_url: searchScreenUrl,
             filled_claim_id: valueRightBeforeClick,
             value_immediately_after_typing: valueImmediatelyAfterTyping,
+            duplicate_node_check: duplicateNodeCheck,
+            exact_claim_id_field_id: exactClaimIdFieldId,
             business_type_enabled_before_click: businessTypeEnabled,
             business_type_call_result: businessTypeCallResult,
             nav_result: 'aborted_value_lost_before_click',
@@ -277,6 +314,8 @@ async function checkClaimStatus(companyId, claimId) {
           search_screen_url: searchScreenUrl,
           filled_claim_id: valueRightBeforeClick,
           value_immediately_after_typing: valueImmediatelyAfterTyping,
+          duplicate_node_check: duplicateNodeCheck,
+          exact_claim_id_field_id: exactClaimIdFieldId,
           business_type_enabled_before_click: businessTypeEnabled,
           business_type_call_result: businessTypeCallResult,
           claim_id_value_after_click: claimIdValueAfterClick,
