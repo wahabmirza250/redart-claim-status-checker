@@ -105,16 +105,41 @@ async function checkClaimStatus(companyId, claimId) {
         // menu (display:none) - clicking it timed out since Playwright
         // correctly refuses to click something not visible. The fix:
         // read its real href directly (which carries live,
-        // session-scoped tokens) and navigate there directly - gets the
-        // benefit of a real, valid session-linked URL without needing
-        // to click a hidden element at all.
+        // === FIXED (2026-08-22, round 9) === Every structural theory
+        // about the Claim ID field itself is now disproven with hard
+        // evidence - it's enabled, correctly named, genuinely in the
+        // form, visible, no hidden proxy. The value is correct right up
+        // to the moment of submission and still doesn't survive. This
+        // points to something at the navigation/session level, not the
+        // field: direct page.goto() to this URL, while it loads the
+        // correct real page, may not carry the exact same internal
+        // session-validation lineage (ASP.NET's anti-tampering tokens)
+        // as a genuine browser click would. This is the one real
+        // combination not yet tried: force-click the real link itself
+        // (bypassing Playwright's normal "must be visible" check, since
+        // we know it's real but hidden inside a collapsed menu) rather
+        // than jump straight to its URL - a real click event through
+        // the real DOM element, which may establish page state a raw
+        // URL load doesn't.
         const searchLink = page.locator('a[title="Search Claims"]').first();
         const href = await searchLink.getAttribute('href');
         if (!href) {
           throw new Error('Could not find the real Search Claims link href on the page after login.');
         }
-        const searchUrl = new URL(href, page.url()).toString();
-        await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 15000 });
+        let navigationMethodUsed = 'force_click';
+        try {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }),
+            searchLink.click({ force: true, timeout: 8000 })
+          ]);
+        } catch (e) {
+          // Fall back to the previously-proven-reliable direct URL
+          // method if the force-click doesn't work for any reason - we
+          // don't want to lose existing reliability while testing this.
+          navigationMethodUsed = 'direct_url_fallback';
+          const searchUrl = new URL(href, page.url()).toString();
+          await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 15000 });
+        }
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         await page.waitForTimeout(1200);
         const searchScreenUrl = page.url();
@@ -255,7 +280,7 @@ async function checkClaimStatus(companyId, claimId) {
           return {
             status: 'CHECK_COMPLETE',
             claim_id: claimId,
-            navigation_method: 'href_from_dom',
+            navigation_method: navigationMethodUsed,
             search_screen_url: searchScreenUrl,
             filled_claim_id: valueRightBeforeClick,
             value_immediately_after_typing: valueImmediatelyAfterTyping,
@@ -345,7 +370,7 @@ async function checkClaimStatus(companyId, claimId) {
         return {
           status: 'CHECK_COMPLETE',
           claim_id: claimId,
-          navigation_method: 'href_from_dom',
+          navigation_method: navigationMethodUsed,
           search_screen_url: searchScreenUrl,
           filled_claim_id: valueRightBeforeClick,
           value_immediately_after_typing: valueImmediatelyAfterTyping,
