@@ -80,10 +80,13 @@ app.post('/check-claim-status', (req, res) => {
   if (!claim_id) return res.status(400).json({ error: 'claim_id is required.' });
 
   const jobId = `check-${claim_id}-${Date.now()}`;
-  jobs[jobId] = { status: 'queued', result: null, queuedAt: new Date().toISOString() };
+  // RedArt's status poller understands pending/running/started as nonterminal.
+  // Keep queued work internally, but expose it as pending so it is not
+  // misclassified as a failed checker job before a browser slot opens.
+  jobs[jobId] = { status: 'pending', result: null, queuedAt: new Date().toISOString() };
   pending.push({ jobId, companyId: company_id || null, claimId: claim_id });
   pump();
-  res.json({ status: 'started', jobId, queued: jobs[jobId].status === 'queued', checkStatusAt: `/job-status/${jobId}` });
+  res.json({ status: 'started', jobId, queued: jobs[jobId].status === 'pending', checkStatusAt: `/job-status/${jobId}` });
 });
 
 app.get('/job-status/:jobId', (req, res) => {
