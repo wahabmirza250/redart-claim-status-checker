@@ -18,6 +18,32 @@ const jobs = {};
 const MAX_ACTIVE = Math.max(1, Math.min(4, Number(process.env.STATUS_CHECKER_MAX_ACTIVE || 2)));
 let active = 0;
 const pending = [];
+const activeByClaim = new Map();
+const MAX_PENDING = 50;
+const JOB_RETENTION_MS = 30 * 60 * 1000;
+
+function claimKey(companyId, claimId) {
+  return `${companyId || 'default'}::${String(claimId)}`;
+}
+
+function publicHealth() {
+  return {
+    status: 'ok',
+    service: 'redart-claim-status-checker',
+    active,
+    queued: pending.length,
+    maxActive: MAX_ACTIVE,
+    duplicateCoalescing: true
+  };
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - JOB_RETENTION_MS;
+  for (const [jobId, job] of Object.entries(jobs)) {
+    const finished = job.finishedAt ? Date.parse(job.finishedAt) : NaN;
+    if (Number.isFinite(finished) && finished < cutoff) delete jobs[jobId];
+  }
+}, 5 * 60 * 1000).unref();
 
 function pump() {
   while (active < MAX_ACTIVE && pending.length) {
@@ -46,13 +72,20 @@ function pump() {
       })
       .finally(() => {
         active = Math.max(0, active - 1);
+        if (task.key && activeByClaim.get(task.key) === task.jobId) {
+          activeByClaim.delete(task.key);
+        }
         setImmediate(pump);
       });
   }
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'redart-claim-status-checker', active, queued: pending.length, maxActive: MAX_ACTIVE });
+  res.json(publicHealth());
+});
+
+app.get('/health', (req, res) => {
+  res.json(publicHealth());
 });
 
 app.get('/debug-server-check', (req, res) => {
@@ -79,14 +112,45 @@ app.post('/check-claim-status', (req, res) => {
   const { company_id, claim_id } = req.body || {};
   if (!claim_id) return res.status(400).json({ error: 'claim_id is required.' });
 
+  const key = claimKey(company_id || null, claim_id);
+  const existingJobId = activeByClaim.get(key);
+  if (existingJobId && jobs[existingJobId] && ['pending', 'running'].includes(jobs[existingJobId].status)) {
+    return res.json({
+      status: 'started',
+      jobId: existingJobId,
+      queued: jobs[existingJobId].status === 'pending',
+      coalesced: true,
+      checkStatusAt: `/job-status/${existingJobId}`
+    });
+  }
+
+  if (pending.length >= MAX_PENDING) {
+    return res.status(429).json({
+      error: 'Status checker queue is full. Retry later.',
+      retry_after_seconds: 60
+    });
+  }
+
   const jobId = `check-${claim_id}-${Date.now()}`;
   // RedArt's status poller understands pending/running/started as nonterminal.
   // Keep queued work internally, but expose it as pending so it is not
   // misclassified as a failed checker job before a browser slot opens.
-  jobs[jobId] = { status: 'pending', result: null, queuedAt: new Date().toISOString() };
-  pending.push({ jobId, companyId: company_id || null, claimId: claim_id });
+  jobs[jobId] = {
+    status: 'pending',
+    result: null,
+    key,
+    queuedAt: new Date().toISOString()
+  };
+  activeByClaim.set(key, jobId);
+  pending.push({ jobId, key, companyId: company_id || null, claimId: claim_id });
   pump();
-  res.json({ status: 'started', jobId, queued: jobs[jobId].status === 'pending', checkStatusAt: `/job-status/${jobId}` });
+  res.json({
+    status: 'started',
+    jobId,
+    queued: jobs[jobId].status === 'pending',
+    coalesced: false,
+    checkStatusAt: `/job-status/${jobId}`
+  });
 });
 
 app.get('/job-status/:jobId', (req, res) => {
