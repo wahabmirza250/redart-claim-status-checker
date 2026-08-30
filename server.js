@@ -6,6 +6,7 @@
  */
 const express = require('express');
 const { checkClaimStatus } = require('./statusChecker');
+const { searchClaimsByMemberDate } = require('./tripSearch');
 
 const app = express();
 app.use(express.json());
@@ -54,7 +55,10 @@ function pump() {
       job.status = 'running';
       job.startedAt = new Date().toISOString();
     }
-    checkClaimStatus(task.companyId, task.claimId)
+    const work = task.kind === 'member_date_search'
+      ? searchClaimsByMemberDate(task.companyId, task.memberId, task.serviceDate)
+      : checkClaimStatus(task.companyId, task.claimId);
+    work
       .then(result => {
         jobs[task.jobId] = {
           status: 'done', result,
@@ -147,6 +151,47 @@ app.post('/check-claim-status', (req, res) => {
   res.json({
     status: 'started',
     jobId,
+    queued: jobs[jobId].status === 'pending',
+    coalesced: false,
+    checkStatusAt: `/job-status/${jobId}`
+  });
+});
+
+app.post('/search-claim-by-trip', (req, res) => {
+  const { company_id, member_id, service_date, trip_id } = req.body || {};
+  if (!member_id || !service_date) {
+    return res.status(400).json({ error: 'member_id and service_date are required.' });
+  }
+
+  const key = `${company_id || 'default'}::member-date::${String(member_id)}::${String(service_date)}`;
+  const existingJobId = activeByClaim.get(key);
+  if (existingJobId && jobs[existingJobId] && ['pending', 'running'].includes(jobs[existingJobId].status)) {
+    return res.json({
+      status: 'started',
+      jobId: existingJobId,
+      queued: jobs[existingJobId].status === 'pending',
+      coalesced: true,
+      checkStatusAt: `/job-status/${existingJobId}`
+    });
+  }
+  if (pending.length >= MAX_PENDING) {
+    return res.status(429).json({ error: 'Status checker queue is full. Retry later.', retry_after_seconds: 60 });
+  }
+
+  const safeTrip = String(trip_id || member_id).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 50);
+  const jobId = `search-${safeTrip}-${Date.now()}`;
+  jobs[jobId] = { status: 'pending', result: null, key, queuedAt: new Date().toISOString() };
+  activeByClaim.set(key, jobId);
+  pending.push({
+    jobId, key, kind: 'member_date_search',
+    companyId: company_id || null,
+    memberId: String(member_id),
+    serviceDate: String(service_date),
+    tripId: trip_id || null
+  });
+  pump();
+  res.json({
+    status: 'started', jobId,
     queued: jobs[jobId].status === 'pending',
     coalesced: false,
     checkStatusAt: `/job-status/${jobId}`
