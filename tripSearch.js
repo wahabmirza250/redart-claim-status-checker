@@ -48,6 +48,92 @@ function normalizeDate(value) {
   return `${String(d.getUTCMonth()+1).padStart(2,'0')}/${String(d.getUTCDate()).padStart(2,'0')}/${d.getUTCFullYear()}`;
 }
 
+
+async function locateSearchField(page, role) {
+  const selectors = {
+    member: [
+      '[id$="MemberIDCmnTextBox_Control"]',
+      'input[id*="MemberID" i]',
+      'input[name*="MemberID" i]'
+    ],
+    from: [
+      '[id$="ServiceFromCmnDate_Control"]',
+      '[id$="ServiceFromDateCmnDate_Control"]',
+      'input[id*="ServiceFrom" i]',
+      'input[name*="ServiceFrom" i]',
+      'input[id*="FromDate" i]',
+      'input[name*="FromDate" i]'
+    ],
+    to: [
+      '[id$="ServiceToCmnDate_Control"]',
+      '[id$="ServiceToDateCmnDate_Control"]',
+      'input[id*="ServiceTo" i]',
+      'input[name*="ServiceTo" i]',
+      'input[id*="ToDate" i]',
+      'input[name*="ToDate" i]'
+    ]
+  };
+
+  for (const selector of selectors[role]) {
+    const field = page.locator(selector).filter({ visible: true }).first();
+    if (await field.isVisible().catch(() => false)) return field;
+  }
+
+  // HCPF occasionally changes the generated ASP.NET IDs. Fall back to the
+  // visible Service Information row and select its two date inputs by order.
+  const marked = await page.evaluate((wantedRole) => {
+    const visible = (el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const inputs = [...document.querySelectorAll('input')].filter(el =>
+      visible(el) && !['hidden', 'button', 'submit', 'checkbox', 'radio'].includes((el.type || '').toLowerCase())
+    );
+
+    let target = null;
+    if (wantedRole === 'member') {
+      target = inputs.find(el => {
+        const context = [el.id, el.name, el.getAttribute('aria-label'), el.closest('tr,div,td')?.innerText]
+          .filter(Boolean).join(' ');
+        return /member\s*id/i.test(context);
+      });
+    } else {
+      const containers = [...document.querySelectorAll('tr, fieldset, .form-group, div')].filter(visible);
+      const serviceRow = containers
+        .filter(el => /Service\s+From/i.test(el.innerText || '') && /\bTo\b/i.test(el.innerText || ''))
+        .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)
+        .find(el => {
+          const fields = [...el.querySelectorAll('input')].filter(input =>
+            visible(input) && !['hidden', 'button', 'submit', 'checkbox', 'radio'].includes((input.type || '').toLowerCase())
+          );
+          return fields.length >= 2;
+        });
+      if (serviceRow) {
+        const fields = [...serviceRow.querySelectorAll('input')].filter(input =>
+          visible(input) && !['hidden', 'button', 'submit', 'checkbox', 'radio'].includes((input.type || '').toLowerCase())
+        );
+        target = wantedRole === 'from' ? fields[0] : fields[1];
+      }
+    }
+
+    if (!target) return false;
+    target.setAttribute('data-redart-search-role', wantedRole);
+    return true;
+  }, role);
+
+  if (marked) return page.locator(`[data-redart-search-role="${role}"]`).first();
+
+  const diagnostics = await page.evaluate(() => [...document.querySelectorAll('input')]
+    .filter(el => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && el.type !== 'hidden';
+    })
+    .map(el => ({ id: el.id || null, name: el.name || null, type: el.type || null }))
+    .slice(0, 30));
+  throw new Error(`Could not locate HCPF ${role} search field. Visible inputs: ${JSON.stringify(diagnostics)}`);
+}
+
 async function searchClaimsByMemberDate(companyId, memberId, serviceDate) {
   const config = loadConfig();
   const credentials = await fetchPortalCredentials(companyId || null);
@@ -77,16 +163,15 @@ async function searchClaimsByMemberDate(companyId, memberId, serviceDate) {
     await page.goto(await freshSearchUrl(page), { waitUntil: 'domcontentloaded', timeout: 25000 });
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
 
-    const memberField = page.locator('input[id*="MemberID"], input[name*="MemberID"]').first();
-    const fromField = page.locator('input[id*="ServiceFrom"], input[name*="ServiceFrom"]').first();
-    const toField = page.locator('input[id*="ServiceTo"], input[name*="ServiceTo"]').first();
-    await memberField.waitFor({ state: 'visible', timeout: 12000 });
-    await fromField.waitFor({ state: 'visible', timeout: 12000 });
-    await toField.waitFor({ state: 'visible', timeout: 12000 });
+    const memberField = await locateSearchField(page, 'member');
+    const fromField = await locateSearchField(page, 'from');
+    const toField = await locateSearchField(page, 'to');
 
-    await memberField.fill(wantedMember);
-    await fromField.fill(wantedDate);
-    await toField.fill(wantedDate);
+    for (const [field, value] of [[memberField, wantedMember], [fromField, wantedDate], [toField, wantedDate]]) {
+      await field.click();
+      await field.fill(value);
+      await field.press('Tab').catch(() => {});
+    }
 
     const searchButton = page.locator('[id$="SearchMedicalAndDentalClaimsCmnButton"]').first();
     await searchButton.click();
