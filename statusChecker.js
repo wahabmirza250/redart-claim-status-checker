@@ -110,6 +110,31 @@ async function getFreshSearchClaimsHref(page) {
   return { href: chosen.href, candidates };
 }
 
+/**
+ * Extract claim status from the row's Claim Status column ONLY.
+ * The Claim Status column is typically the 4th column (index 3) or identified
+ * by position after Claim ID, Member, Claim Type. We extract from the cells
+ * immediately following the claim ID match, NOT from the full joined text
+ * which may contain page-wide filter labels.
+ */
+function extractClaimStatusFromRow(cells, claimIdString) {
+  // Find the index of the cell containing our claim ID
+  const claimIdIndex = cells.findIndex(c => c.includes(claimIdString));
+  if (claimIdIndex === -1) return null;
+
+  // HCPF portal typically arranges: [Claim ID, Member, ClaimType, Status, Amount, Date, ...]
+  // Status column is usually index 3 relative to claim ID at index 0, or we scan forward
+  // within a reasonable distance (next 6 cells) and match the FIRST status keyword found.
+  const searchWindow = cells.slice(claimIdIndex, claimIdIndex + 6);
+  for (const cell of searchWindow) {
+    const match = cell.match(/\b(Paid|Suspended|Denied|Rejected|In Process)\b/i);
+    if (match) {
+      return match[1]; // Return the matched keyword in original case from portal
+    }
+  }
+  return null;
+}
+
 async function checkClaimStatus(companyId, claimId) {
   const config = loadConfig(`${__dirname}/hcpf-colorado.json`);
   const portalCredentials = await fetchPortalCredentials('hfc-colorado', companyId || null);
@@ -231,7 +256,7 @@ async function checkClaimStatus(companyId, claimId) {
           .first().inputValue().catch(() => null);
 
         // Find the actual result row for THIS claim. Do not infer Paid from the
-        // search form's status dropdown text.
+        // search form's status dropdown text or page-wide filter labels.
         const parsed = await page.evaluate((wantedClaim) => {
           const rows = Array.from(document.querySelectorAll('tr'));
           for (const row of rows) {
@@ -241,14 +266,13 @@ async function checkClaimStatus(companyId, claimId) {
             if (!cells.length) continue;
             if (!cells.some(c => c.includes(wantedClaim))) continue;
             const joined = cells.join(' | ');
-            const status = joined.match(/\b(Paid|Suspended|Denied|Rejected|In Process)\b/i)?.[1] || null;
+            // Extract status from the row's cells ONLY, not from page-wide text
             const paidAmount = joined.match(/\$[\d,]+(?:\.\d{2})?/)?.[0] || null;
             const dates = joined.match(/\b\d{2}\/\d{2}\/\d{4}\b/g) || [];
             return {
               found: true,
               cells,
               row_text: joined.slice(0, 1000),
-              status,
               paid_amount: paidAmount,
               dates
             };
@@ -258,13 +282,15 @@ async function checkClaimStatus(companyId, claimId) {
             found: false,
             cells: [],
             row_text: null,
-            status: null,
             paid_amount: null,
             dates: [],
             total_records_zero: /Total\s+Records\s*:?\s*0\b/i.test(body),
             body_text_sample: body.slice(0, 3000)
           };
         }, claimIdString);
+
+        // Extract status from row cells ONLY, using the targeted function
+        const detectedStatus = parsed.found ? extractClaimStatusFromRow(parsed.cells, claimIdString) : null;
 
         await page.screenshot({ path: `${__dirname}/last-run-success.png`, fullPage: true }).catch(() => {});
 
@@ -280,7 +306,7 @@ async function checkClaimStatus(companyId, claimId) {
           nav_result: navResult,
           results_url: resultsUrl,
           result_state: parsed.found ? 'RESULTS_FOUND' : (parsed.total_records_zero ? 'NO_RESULTS' : 'NO_RESULTS'),
-          detected_status: parsed.status,
+          detected_status: detectedStatus,
           paid_amount: parsed.paid_amount,
           result_row: parsed.found ? parsed.cells : null,
           wire_capture: capturedPost,
@@ -299,4 +325,5 @@ async function checkClaimStatus(companyId, claimId) {
   }
 }
 
-module.exports = { checkClaimStatus };
+module.exports = { checkClaimStatus, extractClaimStatusFromRow };
+
