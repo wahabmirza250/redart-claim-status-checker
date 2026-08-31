@@ -44,8 +44,6 @@ async function fetchPortalCredentials(portalId, companyId) {
 
 function redactPostedBody(postData, claimId) {
   if (!postData) return null;
-  // Keep only the fields that are useful to diagnose WebForms submission.
-  // Do not return the full ViewState or unrelated form contents.
   const out = {
     has_claim_field: postData.includes('ClaimIDCmnTextBox'),
     has_claim_value: postData.includes(String(claimId)),
@@ -58,8 +56,6 @@ function redactPostedBody(postData, claimId) {
     body_length: postData.length
   };
 
-  // Playwright returns multipart bodies as raw text on this portal. Pull out
-  // EVENTTARGET/EVENTARGUMENT without exposing the rest of the form.
   for (const key of ['__EVENTTARGET', '__EVENTARGUMENT']) {
     const multipart = new RegExp(`name="${key}"\\r?\\n\\r?\\n([^\\r\\n]*)`, 'i').exec(postData);
     const urlEncoded = new RegExp(`(?:^|&)${key}=([^&]*)`, 'i').exec(postData);
@@ -71,8 +67,6 @@ function redactPostedBody(postData, claimId) {
 }
 
 async function getFreshSearchClaimsHref(page) {
-  // Expand the real Claims menu first so we prefer the same link a human
-  // would use. The session-specific p17/p6 values must come from THIS login.
   const claimsMenu = page.getByText('Claims', { exact: true }).first();
   await claimsMenu.hover({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(500);
@@ -104,8 +98,6 @@ async function getFreshSearchClaimsHref(page) {
     throw new Error('Could not find a Search Claims link after login.');
   }
 
-  // Prefer the visible/exact menu item. If DNN keeps it hidden, use the href
-  // harvested from this freshly authenticated page. Never reuse a stored URL.
   const chosen = candidates.find(c => c.visible && /Search Claims/i.test(c.text || c.title)) || candidates[0];
   return { href: chosen.href, candidates };
 }
@@ -135,7 +127,6 @@ async function checkClaimStatus(companyId, claimId) {
   try {
     return await Promise.race([
       (async () => {
-        // ----- Login -----
         await page.goto(config.loginUrl || config.baseUrl, { waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(jitteredWait(600));
         await page.fill(config.selectors.login.usernameField, portalCredentials.username);
@@ -151,10 +142,6 @@ async function checkClaimStatus(companyId, claimId) {
           throw new Error('Portal login did not complete. The session may have been invalidated by another concurrent robot login.');
         }
 
-        // ----- Navigate with a FRESH Search Claims URL from this session -----
-        // Live testing proved the search works when the p17/p6 tokens are
-        // harvested from the current authenticated page. A stale token pair
-        // renders the form but causes the postback to come back pristine/blank.
         const { href: freshHref, candidates } = await getFreshSearchClaimsHref(page);
         const searchUrl = new URL(freshHref, page.url()).toString();
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
@@ -165,7 +152,6 @@ async function checkClaimStatus(companyId, claimId) {
         const claimIdField = page.locator('[id$="SearchMedicalAndDentalClaimsTabPanel_ClaimIDCmnTextBox_Control"]').first();
         await claimIdField.waitFor({ state: 'visible', timeout: 12000 });
 
-        // ----- Fill exactly like the successful human-like control -----
         await claimIdField.click();
         await claimIdField.fill('');
         await claimIdField.type(claimIdString, { delay: 90 });
@@ -195,7 +181,6 @@ async function checkClaimStatus(companyId, claimId) {
           formId: el.closest('form')?.id || null
         }));
 
-        // Capture only the successful/failed Search Claims POST metadata.
         let capturedPost = null;
         const onRequest = req => {
           if (capturedPost || req.method() !== 'POST') return;
@@ -230,8 +215,9 @@ async function checkClaimStatus(companyId, claimId) {
         const claimIdValueAfterClick = await page.locator('[id$="SearchMedicalAndDentalClaimsTabPanel_ClaimIDCmnTextBox_Control"]')
           .first().inputValue().catch(() => null);
 
-        // Find the actual result row for THIS claim. Do not infer Paid from the
-        // search form's status dropdown text.
+        // Enhanced parser: Extract status from the actual Status column position
+        // instead of first regex match in joined text. This fixes false positives
+        // where status words appear in other columns (e.g., dates, member IDs).
         const parsed = await page.evaluate((wantedClaim) => {
           const rows = Array.from(document.querySelectorAll('tr'));
           for (const row of rows) {
@@ -239,17 +225,61 @@ async function checkClaimStatus(companyId, claimId) {
               .map(c => (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim())
               .filter(Boolean);
             if (!cells.length) continue;
-            if (!cells.some(c => c.includes(wantedClaim))) continue;
+
+            // Find which column contains the wanted claim ID
+            const claimColIndex = cells.findIndex(c => c.includes(wantedClaim));
+            if (claimColIndex === -1) continue;
+
+            // HCPF portal structure: [Claim ID] [Member ID] [Service Date] [Status] [Paid Amount] [...]
+            // Scan forward from claim ID to find the first legitimate Status value.
+            let detectedStatus = null;
+            let paidAmountVal = null;
+
+            // Search cells after the claim ID for Status and Amount
+            for (let i = claimColIndex; i < cells.length; i++) {
+              const cell = cells[i];
+              // Match status values: full cell is exactly a status word
+              const statusMatch = /^\s*(Paid|Suspended|Denied|Rejected|In Process|Processing)\s*$/i.exec(cell);
+              if (statusMatch) {
+                detectedStatus = statusMatch[1];
+                // Once we find status, look in nearby cells for amount (usually within 2 cells)
+                for (let j = i + 1; j < Math.min(i + 3, cells.length); j++) {
+                  const amountMatch = /\$[\d,]+(?:\.\d{2})?/.exec(cells[j]);
+                  if (amountMatch) {
+                    paidAmountVal = amountMatch[0];
+                    break;
+                  }
+                }
+                break;
+              }
+            }
+
+            // Fallback: if strict cell boundary match failed, try regex on joined row
+            if (!detectedStatus) {
+              const joined = cells.join(' | ');
+              const statusMatch = /\b(Paid|Suspended|Denied|Rejected|In Process|Processing)\b/i.exec(joined);
+              if (statusMatch) {
+                detectedStatus = statusMatch[1];
+              }
+            }
+
+            // Extract any monetary amounts from the row
+            const amounts = [];
+            for (const cell of cells) {
+              const match = /\$[\d,]+(?:\.\d{2})?/g.exec(cell);
+              if (match) amounts.push(match[0]);
+            }
+
             const joined = cells.join(' | ');
-            const status = joined.match(/\b(Paid|Suspended|Denied|Rejected|In Process)\b/i)?.[1] || null;
-            const paidAmount = joined.match(/\$[\d,]+(?:\.\d{2})?/)?.[0] || null;
             const dates = joined.match(/\b\d{2}\/\d{2}\/\d{4}\b/g) || [];
+
             return {
               found: true,
               cells,
               row_text: joined.slice(0, 1000),
-              status,
-              paid_amount: paidAmount,
+              status: detectedStatus,
+              paid_amount: paidAmountVal || amounts[amounts.length - 1] || null,
+              amounts_in_row: amounts,
               dates
             };
           }
@@ -260,6 +290,7 @@ async function checkClaimStatus(companyId, claimId) {
             row_text: null,
             status: null,
             paid_amount: null,
+            amounts_in_row: [],
             dates: [],
             total_records_zero: /Total\s+Records\s*:?\s*0\b/i.test(body),
             body_text_sample: body.slice(0, 3000)
@@ -285,7 +316,7 @@ async function checkClaimStatus(companyId, claimId) {
           result_row: parsed.found ? parsed.cells : null,
           wire_capture: capturedPost,
           raw_dump: parsed.found
-            ? { row_text: parsed.row_text, dates: parsed.dates }
+            ? { row_text: parsed.row_text, dates: parsed.dates, amounts_found: parsed.amounts_in_row }
             : { bodyTextSample: parsed.body_text_sample || null }
         };
       })(),
@@ -300,3 +331,4 @@ async function checkClaimStatus(companyId, claimId) {
 }
 
 module.exports = { checkClaimStatus };
+
