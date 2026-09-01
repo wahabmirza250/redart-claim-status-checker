@@ -102,6 +102,129 @@ async function getFreshSearchClaimsHref(page) {
   return { href: chosen.href, candidates };
 }
 
+
+function normalizePortalStatus(value) {
+  const raw = String(value || '').trim();
+  if (/^paid$/i.test(raw)) return 'paid';
+  if (/^denied$/i.test(raw)) return 'denied';
+  if (/error\s+submitted\s+data/i.test(raw)) return 'error_submitted_data';
+  if (/suspend/i.test(raw)) return 'suspended';
+  if (/process|pending|review/i.test(raw)) return 'processing';
+  if (/reject/i.test(raw)) return 'rejected';
+  return raw ? 'unknown' : 'not_found';
+}
+
+function parseMoney(value) {
+  const parsed = Number(String(value || '').replace(/[$,\s]/g, ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function readClaimDetail(page) {
+  const raw = await page.evaluate(() => {
+    const clean = value => String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    const rows = Array.from(document.querySelectorAll('tr'));
+
+    const pairedValue = wantedLabel => {
+      const wanted = clean(wantedLabel).toLowerCase();
+      for (const row of rows) {
+        const cells = Array.from(row.querySelectorAll(':scope > th, :scope > td'));
+        for (let i = 0; i < cells.length; i++) {
+          if (clean(cells[i].innerText || cells[i].textContent).toLowerCase() !== wanted) continue;
+          for (let j = i + 1; j < cells.length; j++) {
+            const value = clean(cells[j].innerText || cells[j].textContent);
+            if (value) return value;
+          }
+        }
+      }
+      return null;
+    };
+
+    const tables = Array.from(document.querySelectorAll('table'));
+    const errorTable = tables.find(table => {
+      const text = clean(table.innerText || table.textContent).toLowerCase();
+      return text.includes('eob') && text.includes('description');
+    });
+    const adjudicationErrors = [];
+    if (errorTable) {
+      const tableRows = Array.from(errorTable.querySelectorAll('tr'));
+      const header = tableRows.find(row => {
+        const text = clean(row.innerText || row.textContent).toLowerCase();
+        return text.includes('eob') && text.includes('description');
+      });
+      const headers = header ? Array.from(header.querySelectorAll('th,td')).map(cell => clean(cell.innerText || cell.textContent).toLowerCase()) : [];
+      const eobIndex = headers.findIndex(name => name === 'eob');
+      const descriptionIndex = headers.findIndex(name => name.includes('description'));
+      const levelIndex = headers.findIndex(name => /header|detail/.test(name));
+      for (const row of tableRows) {
+        if (row === header) continue;
+        const cells = Array.from(row.querySelectorAll('td'));
+        const eob = eobIndex >= 0 ? clean(cells[eobIndex]?.innerText || cells[eobIndex]?.textContent) : null;
+        const description = descriptionIndex >= 0 ? clean(cells[descriptionIndex]?.innerText || cells[descriptionIndex]?.textContent) : null;
+        if (eob || description) {
+          adjudicationErrors.push({
+            level: levelIndex >= 0 ? clean(cells[levelIndex]?.innerText || cells[levelIndex]?.textContent) : null,
+            eob_code: eob,
+            description
+          });
+        }
+      }
+    }
+
+    const serviceTable = tables.find(table => {
+      const text = clean(table.innerText || table.textContent).toLowerCase();
+      return text.includes('procedure code') && text.includes('units') && text.includes('charge amount');
+    });
+    const serviceLines = [];
+    if (serviceTable) {
+      const tableRows = Array.from(serviceTable.querySelectorAll('tr'));
+      const header = tableRows.find(row => {
+        const text = clean(row.innerText || row.textContent).toLowerCase();
+        return text.includes('procedure code') && text.includes('units');
+      });
+      const headers = header ? Array.from(header.querySelectorAll('th,td')).map(cell => clean(cell.innerText || cell.textContent).toLowerCase()) : [];
+      const find = pattern => headers.findIndex(name => pattern.test(name));
+      const fields = {
+        from_date: find(/^from date$/),
+        to_date: find(/^to date$/),
+        procedure_code: find(/procedure code/),
+        modifier: find(/^mod$/),
+        units: find(/^units$/),
+        charge_amount: find(/charge amount/),
+        allowed_amount: find(/allowed amount/)
+      };
+      for (const row of tableRows) {
+        if (row === header) continue;
+        const cells = Array.from(row.querySelectorAll('td'));
+        const line = Object.fromEntries(Object.entries(fields).map(([name, index]) => [
+          name,
+          index >= 0 ? clean(cells[index]?.innerText || cells[index]?.textContent) : null
+        ]));
+        if (line.procedure_code) serviceLines.push(line);
+      }
+    }
+
+    const body = document.body.innerText || '';
+    return {
+      claim_id: (body.match(/View Professional Claim\s*-?\s*ID\s+(\d+)/i) || [])[1] || null,
+      raw_status: pairedValue('Claim Status'),
+      total_charged_amount: pairedValue('Total Charged Amount'),
+      total_allowed_amount: pairedValue('Total Allowed Amount'),
+      total_paid_amount: pairedValue('Total Paid Amount'),
+      adjudication_errors: adjudicationErrors,
+      service_lines: serviceLines
+    };
+  });
+
+  return {
+    ...raw,
+    normalized_status: normalizePortalStatus(raw.raw_status),
+    charged_amount: parseMoney(raw.total_charged_amount),
+    allowed_amount: parseMoney(raw.total_allowed_amount),
+    paid_amount: parseMoney(raw.total_paid_amount),
+    denial_reasons: raw.adjudication_errors
+  };
+}
+
 async function checkClaimStatus(companyId, claimId) {
   const config = loadConfig(`${__dirname}/hcpf-colorado.json`);
   const portalCredentials = await fetchPortalCredentials('hfc-colorado', companyId || null);
@@ -297,6 +420,20 @@ async function checkClaimStatus(companyId, claimId) {
           };
         }, claimIdString);
 
+        let claimDetail = null;
+        if (parsed.found) {
+          const exactClaimLink = page.locator('a').filter({ hasText: claimIdString }).last();
+          if (await exactClaimLink.isVisible().catch(() => false)) {
+            await Promise.all([
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+              exactClaimLink.click({ timeout: 10000 })
+            ]);
+            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+            await page.waitForTimeout(700);
+            claimDetail = await readClaimDetail(page);
+          }
+        }
+
         await page.screenshot({ path: `${__dirname}/last-run-success.png`, fullPage: true }).catch(() => {});
 
         return {
@@ -311,8 +448,14 @@ async function checkClaimStatus(companyId, claimId) {
           nav_result: navResult,
           results_url: resultsUrl,
           result_state: parsed.found ? 'RESULTS_FOUND' : (parsed.total_records_zero ? 'NO_RESULTS' : 'NO_RESULTS'),
-          detected_status: parsed.status,
-          paid_amount: parsed.paid_amount,
+          detected_status: claimDetail?.raw_status || parsed.status,
+          normalized_status: claimDetail?.normalized_status || normalizePortalStatus(parsed.status),
+          paid_amount: claimDetail?.paid_amount ?? parseMoney(parsed.paid_amount),
+          charged_amount: claimDetail?.charged_amount ?? null,
+          allowed_amount: claimDetail?.allowed_amount ?? null,
+          denial_reasons: claimDetail?.denial_reasons || [],
+          service_lines: claimDetail?.service_lines || [],
+          claim_detail: claimDetail,
           result_row: parsed.found ? parsed.cells : null,
           wire_capture: capturedPost,
           raw_dump: parsed.found
