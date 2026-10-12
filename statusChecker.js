@@ -28,7 +28,7 @@ async function fetchPortalCredentials(portalId, companyId) {
   let url = `${baseUrl.replace(/\/$/, '')}/api/public/get-portal-credential?portal_id=${encodeURIComponent(portalId)}`;
   if (companyId) url += `&company_id=${encodeURIComponent(companyId)}`;
 
-  const res = await fetch(url, { headers: { 'X-API-Key': apiKey } });
+  const res = await fetch(url, { headers: { 'X-API-Key': apiKey }, signal: AbortSignal.timeout(20000) });
   const body = await res.json().catch(() => ({}));
 
   if (!res.ok) {
@@ -344,13 +344,13 @@ async function checkClaimStatus(companyId, claimId) {
         const parsed = await page.evaluate((wantedClaim) => {
           const rows = Array.from(document.querySelectorAll('tr'));
           for (const row of rows) {
-            const cells = Array.from(row.querySelectorAll('th,td'))
+            const cells = Array.from(row.children).filter(c => /^(TH|TD)$/.test(c.tagName) && !c.querySelector('table'))
               .map(c => (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim())
               .filter(Boolean);
             if (!cells.length) continue;
 
             // Find which column contains the wanted claim ID
-            const claimColIndex = cells.findIndex(c => c.includes(wantedClaim));
+            const claimColIndex = cells.findIndex(c => c === wantedClaim);
             if (claimColIndex === -1) continue;
 
             // HCPF portal structure: [Claim ID] [Member ID] [Service Date] [Status] [Paid Amount] [...]
@@ -380,7 +380,7 @@ async function checkClaimStatus(companyId, claimId) {
             // Fallback: if strict cell boundary match failed, try regex on joined row
             if (!detectedStatus) {
               const joined = cells.join(' | ');
-              const statusMatch = /\b(Paid|Suspended|Denied|Rejected|In Process|Processing)\b/i.exec(joined);
+              const statusMatch = /(?:^|\|)\s*(Paid|Suspended|Denied|Rejected|In Process|Processing)\s*(?:\||$)/i.exec(joined);
               if (statusMatch) {
                 detectedStatus = statusMatch[1];
               }
@@ -431,6 +431,8 @@ async function checkClaimStatus(companyId, claimId) {
             await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
             await page.waitForTimeout(700);
             claimDetail = await readClaimDetail(page);
+            // Detail metadata is usable only when the opened page proves this claim.
+            if (String(claimDetail?.claim_id || '') !== claimIdString || !claimDetail?.raw_status) claimDetail = null;
           }
         }
 
