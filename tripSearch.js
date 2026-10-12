@@ -16,7 +16,7 @@ async function fetchPortalCredentials(companyId) {
   if (!baseUrl || !apiKey) throw new Error('BILLING_API_URL / BILLING_API_KEY env vars are not set.');
   let url = `${baseUrl.replace(/\/$/, '')}/api/public/get-portal-credential?portal_id=hfc-colorado`;
   if (companyId) url += `&company_id=${encodeURIComponent(companyId)}`;
-  const res = await fetch(url, { headers: { 'X-API-Key': apiKey } });
+  const res = await fetch(url, { headers: { 'X-API-Key': apiKey }, signal: AbortSignal.timeout(20000) });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Portal credential lookup failed (${res.status}): ${body.error || body.message || 'unknown error'}`);
   if (!body.login_email || !body.login_password) throw new Error('Portal credential response is incomplete.');
@@ -183,11 +183,11 @@ async function searchClaimsByMemberDate(companyId, memberId, serviceDate) {
       const clean = s => (s || '').replace(/\s+/g, ' ').trim();
       const results = [];
       for (const row of document.querySelectorAll('tr')) {
-        const cells = [...row.querySelectorAll('td')].map(c => clean(c.innerText || c.textContent)).filter(Boolean);
+        const cells = [...row.children].filter(c => c.tagName === 'TD' && !c.querySelector('table')).map(c => clean(c.innerText || c.textContent)).filter(Boolean);
         const joined = cells.join(' | ');
-        const claimId = joined.match(/\b\d{12,14}\b/)?.[0];
-        if (!claimId || !joined.includes(wantedMember) || !joined.includes(wantedDate)) continue;
-        const status = joined.match(/\b(Paid|Suspended|Denied|Rejected|In Process|Processing)\b/i)?.[1] || null;
+        const claimId = cells.find(c => /^\d{12,14}$/.test(c));
+        if (!claimId || !cells.some(c => c.toUpperCase() === wantedMember.toUpperCase()) || !cells.includes(wantedDate) || results.some(r => r.claim_id === claimId)) continue;
+        const status = cells.find(c => /^(Paid|Suspended|Denied|Rejected|In Process|Processing)$/i.test(c)) || null;
         const amounts = joined.match(/\$[\d,]+(?:\.\d{2})?/g) || [];
         results.push({
           claim_id: claimId,
